@@ -1,0 +1,10 @@
+#!/bin/bash
+# Post-build script for Binder
+# Installs RDKit and other dependencies that need conda
+
+# Install RDKit via conda (required for molecular operations)
+conda install -c conda-forge rdkit -y
+
+# Verify installation
+python -c "import rdkit; print(f'RDKit version: {rdkit.__version__}')"
+python -c "import torch; print(f'PyTorch version: {torch.__version__}')"
