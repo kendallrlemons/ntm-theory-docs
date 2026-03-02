@@ -145,14 +145,3 @@ $$\mathcal{L}_{thermo} = \int_0^1 \sqrt{\text{Var}_\lambda\left(\frac{\partial H
 This measures how much the potential energy derivative fluctuates along the alchemical path—computable only *after* running expensive MD.
 
 Our surrogate hypothesis: **Structural dissimilarity in a learned embedding space correlates with this thermodynamic quantity.** We train on historical FEP outcomes to learn this correlation.
-
-## Citation
-
-If you use this work, please cite the relevant papers on:
-- Graph Neural Networks for molecular property prediction
-- Free Energy Perturbation methods
-- Riemannian metric learning
-
-## License
-
-MIT License - See LICENSE file for details.
