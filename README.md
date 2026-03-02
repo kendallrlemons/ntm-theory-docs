@@ -37,7 +37,6 @@ ntm-theory-docs/
 │   ├── 02_model_architecture.ipynb         # GNN and metric tensor design
 │   ├── 03_geodesics_and_paths.ipynb        # Computing optimal paths
 │   ├── 04_energy_landscapes.ipynb          # Visualizing the manifold
-│   ├── 05_practical_workflow.ipynb         # End-to-end tutorial
 │   ├── 06_experimental_validation.ipynb    # PhD thesis experiments
 │   ├── 07_interpretability_analysis.ipynb  # Feature importance & explanations
 │   └── 08_generative_path_optimization.ipynb # Generative models for intermediates
