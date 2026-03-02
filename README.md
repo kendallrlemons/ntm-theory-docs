@@ -42,7 +42,7 @@ ntm-theory-docs/
 │   ├── 07_interpretability_analysis.ipynb  # Feature importance & explanations
 │   └── 08_generative_path_optimization.ipynb # Generative models for intermediates
 ├── src/
-│   └── ntm_core.py                         # Core implementation
+│   └── ntm_core.py                         # Example of What Core implementation Looks Like
 ├── figures/
 │   └── (generated figures)
 └── README.md
