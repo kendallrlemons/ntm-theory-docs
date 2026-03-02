@@ -123,18 +123,7 @@ For PhD thesis rigor, we provide comprehensive experimental validation:
 | **Computational Efficiency** | How much compute does NTM-guided selection save? |
 | **Interpretability** | What molecular features drive predictions? |
 
-## Limitations and Validity
 
-### When the Surrogate Works Well
-- Training data covers similar chemical space
-- Transformations involve R-group changes (not scaffold hops)
-- Protein target behaves similarly to training examples
-
-### When to Be Cautious
-- Novel chemotypes outside training distribution
-- Unusual binding modes or significant protein flexibility
-- Core hopping or large structural changes
-- Different solvation environments than training data
 
 ### What We Are Actually Approximating
 
