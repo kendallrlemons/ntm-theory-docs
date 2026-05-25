@@ -22,7 +22,7 @@ Usage
 -----
     python hypersphere_rbfe.py
 
-Defaults are hardcoded in the CONFIG block below. Edit those to point at your
+Defaults are hardcoded in the CONFIG block below. Edit those to point at the
 CSV, set output directory, sample size, seed, etc. All CLI flags still work
 and override the defaults (e.g. --phases 1,3 to run a subset of phases).
 Artifacts are saved under --output_dir/phase{N}/ so later phases can resume.
