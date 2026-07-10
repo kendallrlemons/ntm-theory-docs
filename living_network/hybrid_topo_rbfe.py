@@ -35,6 +35,7 @@ import argparse
 import os
 import pickle
 import random
+import sys
 import time
 from typing import Dict, List, Optional, Tuple
 
@@ -131,14 +132,21 @@ def parse_args():
     p.add_argument("--batch_size",   type=int, default=256)
     p.add_argument("--lr",           type=float, default=1e-3)
     p.add_argument("--epochs",       type=int, default=60)
-    p.add_argument("--patience",     type=int, default=10)
+    p.add_argument("--patience",     type=int, default=20,
+                   help="Early-stop patience in epochs, measured against val "
+                        "Spearman rho. Should exceed the LR scheduler's own "
+                        "patience (3) so LR decay gets a chance to help first.")
     p.add_argument("--num_workers",  type=int, default=4)
     p.add_argument("--seed",         type=int, default=DEFAULT_SEED)
     p.add_argument("--mcs_timeout",  type=int, default=5,
                    help="MCS search timeout per pair (seconds)")
-    p.add_argument("--precompute",    action="store_true",
+    p.add_argument("--precompute",       action="store_true",
                    help="Pre-build all hybrid graphs in Phase 2 and cache to disk. "
                         "Eliminates per-epoch MCS cost; recommended for large datasets.")
+    p.add_argument("--graph_cache_dir",  default=None,
+                   help="Directory containing graphs_all.pt and cleaned.pkl produced "
+                        "by mcs_precompute.py.  If omitted, falls back to "
+                        "{output_dir}/phase2_hybrid (legacy location).")
     return p.parse_args()
 
 
@@ -455,12 +463,28 @@ def precompute_graphs(df: pd.DataFrame, split: str, args, phase_dir: str) -> str
     return out_path
 
 
-def _load_graphs(split: str, phase2_dir: str) -> Optional[list]:
-    """Return precomputed graph list if cache exists, else None."""
-    p = os.path.join(phase2_dir, f"graphs_{split}.pt")
-    if os.path.exists(p):
-        print(f"    Loading precomputed {split} graphs from {p} ...")
-        return torch.load(p, weights_only=False)
+def _load_graphs(split: str, phase2_dir: str,
+                 df_index=None) -> Optional[list]:
+    """Return a graph list for the given split, or None if no cache exists.
+
+    Checks two locations in order:
+    1. graphs_all.pt (produced by mcs_precompute.py) — sliced by df_index.
+    2. graphs_{split}.pt (legacy per-split files).
+    """
+    all_path   = os.path.join(phase2_dir, "graphs_all.pt")
+    split_path = os.path.join(phase2_dir, f"graphs_{split}.pt")
+
+    if os.path.exists(all_path):
+        print(f"    Loading graphs_all.pt and slicing for {split} ...")
+        all_graphs = torch.load(all_path, weights_only=False)
+        if df_index is None:
+            return all_graphs
+        return [all_graphs[i] for i in df_index]
+
+    if os.path.exists(split_path):
+        print(f"    Loading precomputed {split} graphs from {split_path} ...")
+        return torch.load(split_path, weights_only=False)
+
     return None
 
 
@@ -672,13 +696,19 @@ def phase3_train(df: pd.DataFrame, args, output_dir: str) -> str:
     phase_dir = os.path.join(output_dir, "phase3_hybrid")
     os.makedirs(phase_dir, exist_ok=True)
 
-    train_df = df[df.split == "train"].reset_index(drop=True)
-    val_df   = df[df.split == "val"].reset_index(drop=True)
+    train_orig = df[df.split == "train"].index
+    val_orig   = df[df.split == "val"].index
+    train_df   = df[df.split == "train"].reset_index(drop=True)
+    val_df     = df[df.split == "val"].reset_index(drop=True)
 
     print("\n[3.1] Building data loaders")
-    phase2_dir = os.path.join(output_dir, "phase2_hybrid")
-    train_graphs = _load_graphs("train", phase2_dir)
-    val_graphs   = _load_graphs("val",   phase2_dir)
+    phase2_dir = (
+        args.graph_cache_dir
+        if args.graph_cache_dir
+        else os.path.join(output_dir, "phase2_hybrid")
+    )
+    train_graphs = _load_graphs("train", phase2_dir, df_index=train_orig)
+    val_graphs   = _load_graphs("val",   phase2_dir, df_index=val_orig)
     _, train_loader = _build_loader(train_df, args, shuffle=True,  graphs=train_graphs)
     _, val_loader   = _build_loader(val_df,   args, shuffle=False, graphs=val_graphs)
 
@@ -691,18 +721,23 @@ def phase3_train(df: pd.DataFrame, args, output_dir: str) -> str:
     print(f"    Params: {n_params:,}")
 
     optim = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=1e-5)
-    best_val_mse = float("inf")
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optim, mode="max", factor=0.5, patience=3, min_lr=1e-6,
+    )
+    best_val_rho = -float("inf")
     best_ckpt = os.path.join(phase_dir, "best.pt")
     patience_ctr = 0
     history = []
 
     print("\n[3.2] Training")
+    n_train_batches = len(train_loader)
+    LOG_EVERY_BATCH = max(1, n_train_batches // 20)  # ~20 progress lines/epoch
     for epoch in range(args.epochs):
         model.train()
         t0 = time.time()
         total_loss, total_n = 0.0, 0
 
-        for batch, y in train_loader:
+        for bi, (batch, y) in enumerate(train_loader):
             if batch is None:
                 continue
             batch = {k: v.to(DEVICE) for k, v in batch.items()}
@@ -715,6 +750,13 @@ def phase3_train(df: pd.DataFrame, args, output_dir: str) -> str:
             optim.step()
             total_loss += loss.item() * y.size(0)
             total_n    += y.size(0)
+
+            if (bi + 1) % LOG_EVERY_BATCH == 0 or (bi + 1) == n_train_batches:
+                dt_so_far = time.time() - t0
+                rate      = (bi + 1) / max(dt_so_far, 1e-6)
+                print(f"    ep {epoch+1:3d}  batch {bi+1:,}/{n_train_batches:,}  "
+                      f"running_mse={total_loss/max(total_n,1):.4f}  "
+                      f"{rate:.1f} batch/s  ({dt_so_far:.0f}s elapsed)")
 
         # Validation
         model.eval()
@@ -734,14 +776,19 @@ def phase3_train(df: pd.DataFrame, args, output_dir: str) -> str:
         val_rho   = float(spearmanr(val_preds, val_true).correlation)
         dt        = time.time() - t0
 
+        prev_lr = optim.param_groups[0]["lr"]
+        scheduler.step(val_rho)
+        new_lr  = optim.param_groups[0]["lr"]
+        lr_note = f"  lr↓{new_lr:.2e}" if new_lr < prev_lr else ""
+
         print(f"  ep {epoch+1:3d}  "
               f"train_mse={total_loss/max(total_n,1):.4f}  "
-              f"val_mse={val_mse:.4f}  val_ρ={val_rho:.3f}  ({dt:.0f}s)")
+              f"val_mse={val_mse:.4f}  val_ρ={val_rho:.3f}  ({dt:.0f}s){lr_note}")
 
         history.append({"epoch": epoch+1, "val_mse": val_mse, "val_rho": val_rho})
 
-        if val_mse < best_val_mse:
-            best_val_mse = val_mse
+        if val_rho > best_val_rho:
+            best_val_rho = val_rho
             torch.save({"model": model.state_dict(), "args": vars(args)}, best_ckpt)
             patience_ctr = 0
         else:
@@ -814,9 +861,10 @@ def phase4_evaluate(df: pd.DataFrame, args, ckpt_path: str, output_dir: str):
     phase_dir = os.path.join(output_dir, "phase4_hybrid")
     os.makedirs(phase_dir, exist_ok=True)
 
-    test_df = df[df.split == "test"].reset_index(drop=True)
-    n_eval  = min(20_000, len(test_df))
-    eval_df = test_df.sample(n=n_eval, random_state=args.seed).reset_index(drop=True)
+    test_df  = df[df.split == "test"].reset_index(drop=True)
+    n_eval   = min(20_000, len(test_df))
+    eval_pos = test_df.sample(n=n_eval, random_state=args.seed).index  # positions within test_df
+    eval_df  = test_df.loc[eval_pos].reset_index(drop=True)
     print(f"    Evaluating on {n_eval:,} test pairs")
 
     # ---- Load model ----
@@ -830,10 +878,14 @@ def phase4_evaluate(df: pd.DataFrame, args, ckpt_path: str, output_dir: str):
 
     # ---- Model predictions ----
     print("\n[4.1] Computing model predictions")
-    phase2_dir  = os.path.join(output_dir, "phase2_hybrid")
-    test_graphs = _load_graphs("test", phase2_dir)
-    if test_graphs is not None:
-        test_graphs = [test_graphs[i] for i in eval_df.index]
+    phase2_dir  = (
+        args.graph_cache_dir
+        if args.graph_cache_dir
+        else os.path.join(output_dir, "phase2_hybrid")
+    )
+    test_orig   = df[df.split == "test"].index
+    eval_orig   = test_orig[eval_pos]  # correctly maps sampled rows -> original df indices
+    test_graphs = _load_graphs("test", phase2_dir, df_index=eval_orig)
     _, loader = _build_loader(eval_df, args, shuffle=False, graphs=test_graphs)
     all_preds, all_true = [], []
     with torch.no_grad():
@@ -961,14 +1013,15 @@ def phase4_evaluate(df: pd.DataFrame, args, ckpt_path: str, output_dir: str):
 # =============================================================================
 
 def main():
+    sys.stdout.reconfigure(line_buffering=True)  # flush on every newline (SLURM-safe)
     args   = parse_args()
     phases = [int(p) for p in args.phases.split(",")]
     os.makedirs(args.output_dir, exist_ok=True)
     set_seed(args.seed)
 
-    print(f"Device: {DEVICE}")
-    print(f"Phases: {phases}")
-    print(f"Output: {args.output_dir}")
+    print(f"Device: {DEVICE}", flush=True)
+    print(f"Phases: {phases}", flush=True)
+    print(f"Output: {args.output_dir}", flush=True)
 
     df      = None
     ckpt    = None
