@@ -556,7 +556,13 @@ class HybridGNN(nn.Module):
             nn.Linear(64, 1),
         )
 
-    def forward(self, batch: Dict) -> torch.Tensor:
+    def encode(self, batch: Dict) -> torch.Tensor:
+        """Return the pooled/projected embedding (pre-regression-head).
+
+        Exposed separately from forward() so other scripts can reuse this
+        encoder (e.g. to project the embedding onto a hypersphere) without
+        duplicating the message-passing + pooling logic.
+        """
         x = self.node_embed(batch["node_feats"])
         e = self.edge_embed(batch["edge_feats"])
         ei = batch["edge_index"]
@@ -568,8 +574,10 @@ class HybridGNN(nn.Module):
         for i in range(len(ptr) - 1):
             graphs.append(x[ptr[i]:ptr[i + 1]].mean(0))
         g = torch.stack(graphs, dim=0)
-        g = self.proj(g)
-        return self.head(g).squeeze(-1)
+        return self.proj(g)
+
+    def forward(self, batch: Dict) -> torch.Tensor:
+        return self.head(self.encode(batch)).squeeze(-1)
 
 
 # =============================================================================
@@ -832,24 +840,57 @@ def _tanimoto_score(smi_a: str, smi_b: str) -> float:
 
 
 def _lomap_like_score(smi_a: str, smi_b: str, mcs_timeout: int = 5) -> float:
-    ma = Chem.MolFromSmiles(smi_a)
-    mb = Chem.MolFromSmiles(smi_b)
+    """Real LOMAP difficulty score (1 - LOMAP similarity), using the actual
+    `lomap` + `gufe` packages (LomapAtomMapper + default_lomap_score) rather
+    than a hand-rolled approximation. LOMAP is the baseline we're trying to
+    beat, so this needs to reflect the real algorithm's MCS-mapping + rule
+    penalties (ring-breaking, hybridization/charge changes, etc.), not just
+    MCS-coverage averaged with molecular-weight similarity.
+
+    Requires `pip install lomap gufe` (conda-forge: lomap2, gufe).
+    Returns np.nan if either SMILES fails to parse/embed or if no atom
+    mapping is found (e.g. completely disconnected scaffolds).
+    """
+    try:
+        import gufe
+        import lomap
+    except ImportError as e:
+        raise ImportError(
+            "Real LOMAP scoring requires the `lomap` and `gufe` packages "
+            "(conda-forge: lomap2, gufe). Install them, e.g.:\n"
+            "    conda install -c conda-forge lomap2 gufe"
+        ) from e
+
+    def _prep(smi: str):
+        m = Chem.MolFromSmiles(smi)
+        if m is None:
+            return None
+        m = Chem.AddHs(m)
+        try:
+            if AllChem.EmbedMolecule(m, randomSeed=0xC0FFEE) != 0:
+                return None
+            AllChem.MMFFOptimizeMolecule(m, maxIters=200)
+        except Exception:
+            return None
+        return m
+
+    ma = _prep(smi_a)
+    mb = _prep(smi_b)
     if ma is None or mb is None:
         return np.nan
+
     try:
-        res = rdFMCS.FindMCS([ma, mb],
-                             atomCompare=rdFMCS.AtomCompare.CompareElements,
-                             bondCompare=rdFMCS.BondCompare.CompareOrder,
-                             timeout=mcs_timeout)
-        n_mcs = res.numAtoms
+        comp_a = gufe.SmallMoleculeComponent(rdkit=ma)
+        comp_b = gufe.SmallMoleculeComponent(rdkit=mb)
+        mapper = lomap.LomapAtomMapper(time=mcs_timeout, threed=False)
+        mapping = next(iter(mapper.suggest_mappings(comp_a, comp_b)), None)
+        if mapping is None:
+            return np.nan
+        score = lomap.default_lomap_score(mapping)  # 0 (terrible) .. 1 (great)
     except Exception:
-        n_mcs = 0
-    n_total = max(ma.GetNumHeavyAtoms() + mb.GetNumHeavyAtoms() - n_mcs, 1)
-    mcs_coverage = n_mcs / n_total
-    mw_a = Descriptors.MolWt(ma)
-    mw_b = Descriptors.MolWt(mb)
-    mw_sim = min(mw_a, mw_b) / max(mw_a, mw_b) if max(mw_a, mw_b) > 0 else 1.0
-    return 1.0 - 0.5 * (mcs_coverage + mw_sim)
+        return np.nan
+
+    return 1.0 - float(score)
 
 
 def phase4_evaluate(df: pd.DataFrame, args, ckpt_path: str, output_dir: str):
@@ -900,7 +941,7 @@ def phase4_evaluate(df: pd.DataFrame, args, ckpt_path: str, output_dir: str):
     all_true  = np.concatenate(all_true)
 
     # ---- Baselines ----
-    print("\n[4.2] Computing Tanimoto + LOMAP-like baselines")
+    print("\n[4.2] Computing Tanimoto + real-LOMAP baselines")
     tani_scores, lomap_scores = [], []
     for i, row in eval_df.iterrows():
         if i % 2000 == 0:
@@ -947,7 +988,7 @@ def phase4_evaluate(df: pd.DataFrame, args, ckpt_path: str, output_dir: str):
 
     rows = [
         _evaluate(tani_scores,   "Tanimoto (1-sim)"),
-        _evaluate(lomap_scores,  "LOMAP-like (1-sim)"),
+        _evaluate(lomap_scores,  "LOMAP (real, 1-sim)"),
         _evaluate(pred,          "Hybrid-topo GNN"),
     ]
     comp_df = pd.DataFrame(rows).set_index("method")
