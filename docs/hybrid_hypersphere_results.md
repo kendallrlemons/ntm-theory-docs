@@ -82,17 +82,31 @@ Evaluated on 20,000 shared test pairs, real LOMAP score in place of the proxy:
 
 ## 5. Potential issue: train/test split does not group by ligand B
 
-### The split code
+### 5.1 Current split methodology
 
-`hto.phase1_load` (`hybrid_topo_rbfe.py:621-633`) builds the train/val/test split by grouping **only on ligand A**:
+Implemented in `hto.phase1_load` (`hybrid_topo_rbfe.py:621-633`), which `hybrid_hypersphere_rbfe.py` calls directly for Phase 1 (reusing it for exact index alignment with cached graphs). `hypersphere_rbfe.py` has its own separate implementation (`phase1_characterize`, lines ~492-509) that follows the same grouping strategy — group by unique `smi_a` only, same leakage pattern — but is not literally the same function call, so the two scripts' splits are independently generated (different random shuffles) even though the *design* is identical:
+
+1. Take the **unique set of ligand-A SMILES** across the whole dataset — not ligand B, not the pair.
+2. Shuffle that list of unique ligand-A values with a fixed seed (`--seed`, default 42).
+3. The last `test_frac` fraction (default 0.1 → 10%) becomes the **test** ligand-A group; the fraction before that (`val_frac`, default 0.1 → 10%) becomes the **val** ligand-A group. The remaining ~80% is **train**.
+4. Every row (pair) is assigned to whichever split its ligand A falls into. All pairs sharing a given ligand A are therefore guaranteed to land in the same split together.
 
 ```python
-groups = df[SMILES_A_COLUMN].unique()
+groups = df[SMILES_A_COLUMN].unique()      # unique ligand-A values only
+rng = np.random.default_rng(args.seed)
 rng.shuffle(groups)
-...
+n = len(groups)
+n_val  = max(1, int(n * args.val_frac))    # default 10%
+n_test = max(1, int(n * args.test_frac))   # default 10%
+val_g  = set(groups[n - n_val - n_test : n - n_test])
+test_g = set(groups[n - n_test :])
+
+df["split"] = "train"
 df.loc[df[SMILES_A_COLUMN].isin(val_g),  "split"] = "val"
 df.loc[df[SMILES_A_COLUMN].isin(test_g), "split"] = "test"
 ```
+
+### 5.2 The gap this leaves
 
 Every pair sharing a given ligand A is kept together in one split — but **ligand B is never grouped**. The same ligand-B molecule can appear across train, val, *and* test, paired with different A partners each time.
 
