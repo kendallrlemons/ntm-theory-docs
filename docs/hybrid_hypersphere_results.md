@@ -43,7 +43,22 @@ score = lomap.default_lomap_score(mapping)   # 0 (terrible) .. 1 (great)
 
 ---
 
-## 3. Latest six-way comparison results
+## 3. What each method actually does
+
+Before the numbers: a precise description of how each method in the comparison table generates its prediction, since the names alone ("independent", "ablation", "combined") don't fully convey the mechanism.
+
+| Method | Input processing | Embedding / score generation | Geometry | Training objective | Uses `\|SE\|` labels? |
+|---|---|---|---|---|---|
+| **Tanimoto (1 − sim)** | Ligand A and B each converted to a Morgan fingerprint (radius 2, 2048 bits) via RDKit, independently. | Score = 1 − TanimotoSimilarity(fp_A, fp_B). Pure bit-vector overlap; no atom mapping, no learned parameters. | N/A (bit-vector) | None — deterministic formula. | No |
+| **LOMAP (real, 1 − sim)** | Ligand A and B each embedded into a 3D conformer (RDKit `EmbedMolecule` + MMFF), wrapped as `gufe.SmallMoleculeComponent`. | `lomap.LomapAtomMapper` finds the best maximum-common-substructure atom mapping between A and B; `lomap.default_lomap_score` combines exponential MCS-coverage penalties (MCSR/MNACR) with explicit penalties for ring-breaking, ring-size changes, hybridization changes, and charge changes. Score = 1 − LOMAP score. | N/A (rule-based) | None — deterministic algorithm, no training. | No |
+| **Hypersphere (independent)** | Ligand A and B each converted to an atom/bond-featurized molecular graph and encoded **completely separately** — the encoder never sees both molecules together. | Each ligand's graph → MPNN message-passing → pooled to one vector per ligand → L2-normalized onto the unit hypersphere, giving two points `h_a`, `h_b`. A regression head combines `h_a`/`h_b` (via a `hypersphere_rbfe.py`-defined feature such as concatenation/difference/cosine) to predict `\|SE\|`. | Hyperspherical (unit-norm embeddings) | 3-component loss: continuous contrastive (`cos(h_a,h_b)` targets `cos(π·SE_norm)` — similar ligands pulled close, dissimilar pushed apart) + dispersion (spreads learned cluster centers across the sphere) + regression (MSE on `\|SE\|`). | Yes (all 3 loss terms) |
+| **MCS/GNN (independent)** | Ligand A and B are **merged into one hybrid-topology graph** via MCS: atoms tagged core (shared) / A-unique / B-unique. | The single merged graph → one MPNN → one pooled embedding vector representing the *whole transformation* (not either ligand individually) → regression head predicts `\|SE\|` directly from this one vector. This is `hybrid_topo_rbfe.py`'s original, independently-trained/validated model. | Flat Euclidean (no normalization) | Regression only (MSE on `\|SE\|`). | Yes (regression only) |
+| **Hybrid + L2-norm (ablation)** | Same merged hybrid-topology graph construction as `MCS/GNN (independent)` above. | Same MPNN encoder architecture (`HybridGNN.encode()`), but the resulting pair embedding is **L2-normalized onto the hypersphere** before the regression head. Isolates the effect of hyperspherical geometry alone. | Hyperspherical | Regression only (MSE on `\|SE\|`) — no contrastive or dispersion pressure. | Yes (regression only) |
+| **Hybrid + Hypersphere (combined)** | Same merged hybrid-topology graph construction as above. | Same L2-normalized single pair embedding as the ablation, but now trained with the full 3-component objective. Since there is only one embedding per pair (no separate `h_a`/`h_b` to compare), the contrastive term is reformulated across the batch: transformations `i,j` with similar predicted difficulty (`\|SE_i − SE_j\|` small) are pulled close on the sphere; dissimilar-difficulty transformations are pushed apart (`batch_pairwise_contrastive_loss`). Dispersion and regression carry over unchanged. | Hyperspherical | 3-component loss: batch-pairwise contrastive + dispersion + regression (MSE on `\|SE\|`). | Yes (all 3 loss terms) |
+
+---
+
+## 4. Latest six-way comparison results
 
 Evaluated on 20,000 shared test pairs, real LOMAP score in place of the proxy:
 
@@ -61,11 +76,11 @@ Evaluated on 20,000 shared test pairs, real LOMAP score in place of the proxy:
 1. **Both structural baselines are indistinguishable from noise.** Tanimoto and real LOMAP both sit at essentially zero correlation and AUROC ≈ 0.5. This is not an implementation artifact of the old heuristic — the *actual, validated* LOMAP algorithm performs identically to a naive fingerprint-similarity baseline on this dataset's `|SE|` target.
 2. **All three learned models beat both baselines by a wide margin**, with a clear internal ordering: `Hypersphere (independent)` ≫ `Hybrid + Hypersphere (combined)` > `MCS/GNN (independent)` > `Hybrid + L2-norm (ablation)`.
 3. **The 3-component loss helps within the hybrid-encoder family**: combining hyperspherical geometry with contrastive + dispersion losses (r=0.604) beats both the flat-Euclidean hybrid encoder (r=0.523, from the parent `hybrid_topo_rbfe.py`) and the L2-norm-only ablation (r=0.290) — L2-normalizing without the auxiliary losses actively hurts, but adding them back more than recovers the loss and provides a modest net gain.
-4. **The independent hypersphere model's dominance (r=0.91) is the most important number to interpret carefully** — see Section 4.
+4. **The independent hypersphere model's dominance (r=0.91) is the most important number to interpret carefully** — see Section 5.
 
 ---
 
-## 4. Potential issue: train/test split does not group by ligand B
+## 5. Potential issue: train/test split does not group by ligand B
 
 ### The split code
 
@@ -99,9 +114,9 @@ The *less* transformation-aware / more B-isolated the architecture, the *better*
 
 ---
 
-## 5. Planned fix and path forward
+## 6. Planned fix and path forward
 
-### 5.1 Fix the split
+### 6.1 Fix the split
 
 Group by the union of ligand identities appearing in *either* column, so no ligand — A or B — appears in more than one split:
 
@@ -114,7 +129,7 @@ all_ligands = pd.concat([df[SMILES_A_COLUMN], df[SMILES_B_COLUMN]]).unique()
 
 This is a strictly harder generalization test (fewer eligible pairs, since both endpoints must independently land in the same split), so expect the usable dataset size to shrink somewhat.
 
-### 5.2 Re-run the six-way comparison
+### 6.2 Re-run the six-way comparison
 
 Re-run Phase 3 (combined model retraining) and Phase 5 (comparison) under the corrected split.
 
@@ -122,7 +137,7 @@ Re-run Phase 3 (combined model retraining) and Phase 5 (comparison) under the co
 - If the independent hypersphere model's advantage **collapses** toward the hybrid/MCS-GNN numbers → confirms leakage was the primary driver of the previous gap.
 - If it **doesn't collapse much** → more defensible evidence of genuine generalizable signal, and a stronger result overall (though still worth double-checking other leakage vectors, e.g. near-duplicate ligands across splits that differ only trivially).
 
-### 5.3 Other follow-ups noted during this work
+### 6.3 Other follow-ups noted during this work
 
 - **Isolate whether the reformulated contrastive loss helps or hurts** the combined model specifically, by training with `--w_contrastive 0` (dispersion + regression only) and comparing to the current combined result (r=0.604) and the ablation (r=0.290).
 - **Investigate the mechanism gap** between the independent hypersphere approach and the merged-graph hybrid approach in general — even after fixing the split, understanding *why* keeping A and B as two separate embeddings outperforms merging them into one transformation-aware graph is itself a useful modeling question.
