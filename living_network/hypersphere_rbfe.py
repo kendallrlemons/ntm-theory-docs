@@ -56,6 +56,7 @@ from plotly.subplots import make_subplots
 
 from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem, Descriptors, rdFMCS, rdMolDescriptors
+from rdkit.Chem.Scaffolds import MurckoScaffold
 from rdkit import RDLogger
 
 from scipy.stats import pearsonr, spearmanr
@@ -141,6 +142,13 @@ def parse_args():
                    help="Rows to use after cleaning (0 = keep all)")
     p.add_argument("--val_frac", type=float, default=0.1)
     p.add_argument("--test_frac", type=float, default=0.1)
+    p.add_argument("--split_method", choices=["ligand_a", "scaffold"], default="scaffold",
+                   help="'ligand_a' (legacy): group only by ligand-A identity — "
+                        "ligand B can leak across splits. "
+                        "'scaffold' (default): group by Bemis-Murcko scaffold "
+                        "across both ligands, sized by pair count, dropping "
+                        "any pair whose two ligands' scaffolds land in "
+                        "different splits.")
     # Model
     p.add_argument("--hidden_dim", type=int, default=128)
     p.add_argument("--num_layers", type=int, default=4)
@@ -246,7 +254,9 @@ def compute_pair_descriptors(smi_a: str, smi_b: str) -> Optional[PairDescriptors
 
 
 def phase1_characterize(input_csv: str, output_dir: str,
-                        sample_size: int, seed: int) -> pd.DataFrame:
+                        sample_size: int, seed: int,
+                        val_frac: float = 0.1, test_frac: float = 0.1,
+                        split_method: str = "scaffold") -> pd.DataFrame:
     """
     Phase 1: Load, clean, compute descriptors, validate SE as a difficulty signal.
 
@@ -489,30 +499,92 @@ def phase1_characterize(input_csv: str, output_dir: str,
     )
     fig_scatter.write_html(os.path.join(phase_dir, "descriptor_scatter_interactive.html"))
 
-    # ---- Split train/val/test by Mol A (anchor) to prevent leakage ----
-    print("\n[1.5] Splitting train/val/test (grouped by anchor smi_a to avoid leakage)")
-    unique_a = df["smi_a"].unique()
-    rng = np.random.RandomState(seed)
-    rng.shuffle(unique_a)
-    n_a = len(unique_a)
-    n_test = int(n_a * 0.1)
-    n_val = int(n_a * 0.1)
-    test_anchors = set(unique_a[:n_test])
-    val_anchors = set(unique_a[n_test:n_test + n_val])
+    # ---- Split train/val/test ----
+    if split_method == "scaffold":
+        print("\n[1.5] Splitting train/val/test (Bemis-Murcko scaffold, "
+              "grouping by both ligands to avoid leakage)")
 
-    def assign(smi_a):
-        if smi_a in test_anchors:
-            return "test"
-        if smi_a in val_anchors:
-            return "val"
-        return "train"
-    df["split"] = df["smi_a"].map(assign)
+        all_smiles = pd.unique(pd.concat([df["smi_a"], df["smi_b"]], ignore_index=True))
+        scaffold_of = {}
+        for smi in all_smiles:
+            try:
+                scaffold_of[smi] = MurckoScaffold.MurckoScaffoldSmiles(smi=smi)
+            except Exception:
+                scaffold_of[smi] = smi  # fall back to full SMILES if scaffold fails
+
+        df["scaffold_a"] = df["smi_a"].map(scaffold_of)
+        df["scaffold_b"] = df["smi_b"].map(scaffold_of)
+
+        # Size val/test by PAIR COUNT, not scaffold count (see
+        # hybrid_topo_rbfe.py::phase1_load for the same logic/rationale).
+        degree = pd.concat([df["scaffold_a"], df["scaffold_b"]]).value_counts()
+        scaffolds = degree.index.to_numpy()
+        rng = np.random.default_rng(seed)
+        order = rng.permutation(len(scaffolds))
+        scaffolds = scaffolds[order]
+        degrees = degree.values[order]
+
+        n_pairs = len(df)
+        target_val = val_frac * n_pairs
+        target_test = test_frac * n_pairs
+
+        val_s, test_s, train_s = set(), set(), set()
+        val_deg = test_deg = 0
+        for s, d in zip(scaffolds, degrees):
+            if val_deg < target_val:
+                val_s.add(s)
+                val_deg += d
+            elif test_deg < target_test:
+                test_s.add(s)
+                test_deg += d
+            else:
+                train_s.add(s)
+
+        def _scaffold_split(s):
+            if s in val_s:
+                return "val"
+            if s in test_s:
+                return "test"
+            if s in train_s:
+                return "train"
+            return None
+
+        df["split_a"] = df["scaffold_a"].map(_scaffold_split)
+        df["split_b"] = df["scaffold_b"].map(_scaffold_split)
+
+        n_before = len(df)
+        df = df[df["split_a"] == df["split_b"]].reset_index(drop=True)
+        n_dropped = n_before - len(df)
+        df["split"] = df["split_a"]
+        df = df.drop(columns=["scaffold_a", "scaffold_b", "split_a", "split_b"])
+
+        print(f"    Dropped {n_dropped:,} pairs straddling scaffold splits "
+              f"({n_dropped / n_before:.1%})")
+    else:
+        print("\n[1.5] Splitting train/val/test (grouped by anchor smi_a to avoid leakage)")
+        unique_a = df["smi_a"].unique()
+        rng = np.random.RandomState(seed)
+        rng.shuffle(unique_a)
+        n_a = len(unique_a)
+        n_test = int(n_a * test_frac)
+        n_val = int(n_a * val_frac)
+        test_anchors = set(unique_a[:n_test])
+        val_anchors = set(unique_a[n_test:n_test + n_val])
+
+        def assign(smi_a):
+            if smi_a in test_anchors:
+                return "test"
+            if smi_a in val_anchors:
+                return "val"
+            return "train"
+        df["split"] = df["smi_a"].map(assign)
+
     print(f"    Train: {(df.split=='train').sum():,}  "
           f"Val: {(df.split=='val').sum():,}  "
           f"Test: {(df.split=='test').sum():,}")
 
     # Save split as pickle (avoids pyarrow/fastparquet dependency).
-    df.to_pickle(os.path.join(phase_dir, "cleaned_split.pkl"))
+    df.to_pickle(os.path.join(phase_dir, f"cleaned_split_{split_method}.pkl"))
     return df
 
 
@@ -1493,16 +1565,15 @@ def main():
     # Phase 1
     if 1 in phases:
         df = phase1_characterize(args.input, args.output_dir,
-                                  args.sample_size, args.seed)
+                                  args.sample_size, args.seed,
+                                  val_frac=args.val_frac, test_frac=args.test_frac,
+                                  split_method=args.split_method)
     else:
-        p1_pkl = os.path.join(args.output_dir, "phase1", "cleaned_split.pkl")
-        p1_parq = os.path.join(args.output_dir, "phase1", "cleaned_split.parquet")
+        p1_pkl = os.path.join(args.output_dir, "phase1",
+                               f"cleaned_split_{args.split_method}.pkl")
         if os.path.exists(p1_pkl):
             print(f"Loading Phase 1 artifact from {p1_pkl}")
             df = pd.read_pickle(p1_pkl)
-        elif os.path.exists(p1_parq):
-            print(f"Loading Phase 1 artifact from {p1_parq}")
-            df = pd.read_parquet(p1_parq)
 
     # Phase 2 is implicit (graph featurization happens inside Dataset construction).
     if 2 in phases:

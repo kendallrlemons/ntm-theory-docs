@@ -52,6 +52,7 @@ import matplotlib.pyplot as plt
 
 from rdkit import Chem, DataStructs
 from rdkit.Chem import AllChem, Descriptors, rdFMCS, rdMolDescriptors
+from rdkit.Chem.Scaffolds import MurckoScaffold
 from rdkit import RDLogger
 
 from scipy.stats import pearsonr, spearmanr
@@ -125,6 +126,13 @@ def parse_args():
     p.add_argument("--sample_size",  type=int, default=DEFAULT_SAMPLE_SIZE)
     p.add_argument("--val_frac",     type=float, default=0.1)
     p.add_argument("--test_frac",    type=float, default=0.1)
+    p.add_argument("--split_method", choices=["ligand_a", "scaffold"], default="scaffold",
+                   help="'ligand_a' (legacy): group only by ligand-A identity — "
+                        "ligand B can leak across splits. "
+                        "'scaffold' (default): group by Bemis-Murcko scaffold "
+                        "computed from BOTH ligand A and ligand B, so no scaffold "
+                        "appears in more than one split; pairs whose two ligands' "
+                        "scaffolds fall in different splits are dropped.")
     p.add_argument("--hidden_dim",   type=int, default=128)
     p.add_argument("--num_layers",   type=int, default=4)
     p.add_argument("--embed_dim",    type=int, default=128)
@@ -591,7 +599,8 @@ def phase1_load(args, output_dir: str) -> pd.DataFrame:
 
     phase_dir = os.path.join(output_dir, "phase1_hybrid")
     os.makedirs(phase_dir, exist_ok=True)
-    pkl = os.path.join(phase_dir, "cleaned_split.pkl")
+    split_method = getattr(args, "split_method", "ligand_a")
+    pkl = os.path.join(phase_dir, f"cleaned_split_{split_method}.pkl")
 
     if os.path.exists(pkl):
         print(f"    Loading cached split from {pkl}")
@@ -618,20 +627,99 @@ def phase1_load(args, output_dir: str) -> pd.DataFrame:
     print(f"\n[1.2] |SE| distribution:  "
           f"q50={q[0.50]:.4f}  q75={q[0.75]:.4f}  q99={q[0.99]:.4f}")
 
-    # Grouped split by smi_a
-    groups = df[SMILES_A_COLUMN].unique()
-    rng = np.random.default_rng(args.seed)
-    rng.shuffle(groups)
-    n = len(groups)
-    n_val  = max(1, int(n * args.val_frac))
-    n_test = max(1, int(n * args.test_frac))
-    val_g  = set(groups[n - n_val - n_test : n - n_test])
-    test_g = set(groups[n - n_test :])
+    if split_method == "scaffold":
+        print(f"\n[1.3] Split method: scaffold (Bemis-Murcko), grouping by both ligands")
 
-    df["split"] = "train"
-    df.loc[df[SMILES_A_COLUMN].isin(val_g),  "split"] = "val"
-    df.loc[df[SMILES_A_COLUMN].isin(test_g), "split"] = "test"
-    print(f"\n[1.3] Split: "
+        # Compute Bemis-Murcko scaffold for every unique ligand SMILES seen in
+        # either the A or B column.
+        all_smiles = pd.unique(
+            pd.concat([df[SMILES_A_COLUMN], df[SMILES_B_COLUMN]], ignore_index=True)
+        )
+        scaffold_of = {}
+        for smi in all_smiles:
+            try:
+                scaffold_of[smi] = MurckoScaffold.MurckoScaffoldSmiles(smi=smi)
+            except Exception:
+                scaffold_of[smi] = smi  # fall back to full SMILES if scaffold fails
+
+        df["scaffold_a"] = df[SMILES_A_COLUMN].map(scaffold_of)
+        df["scaffold_b"] = df[SMILES_B_COLUMN].map(scaffold_of)
+
+        # Size val/test by PAIR COUNT, not scaffold count. Scaffolds vary
+        # hugely in "popularity" (how many pairs touch them), so assigning
+        # a flat val_frac/test_frac of *scaffolds* can yield val/test pair
+        # counts far smaller than val_frac/test_frac of *pairs*. Instead,
+        # weight each scaffold by its pair-degree (# pairs where it appears
+        # as scaffold_a or scaffold_b) and greedily fill val/test buckets
+        # by degree-weighted random order until the target pair budget is
+        # reached.
+        degree = (
+            pd.concat([df["scaffold_a"], df["scaffold_b"]])
+            .value_counts()
+        )
+        scaffolds = degree.index.to_numpy()
+        rng = np.random.default_rng(args.seed)
+        order = rng.permutation(len(scaffolds))
+        scaffolds = scaffolds[order]
+        degrees = degree.values[order]
+
+        n_pairs = len(df)
+        target_val  = args.val_frac * n_pairs
+        target_test = args.test_frac * n_pairs
+
+        val_s, test_s, train_s = set(), set(), set()
+        val_deg = test_deg = 0
+        for s, d in zip(scaffolds, degrees):
+            if val_deg < target_val:
+                val_s.add(s)
+                val_deg += d
+            elif test_deg < target_test:
+                test_s.add(s)
+                test_deg += d
+            else:
+                train_s.add(s)
+
+        def _scaffold_split(s):
+            if s in val_s:
+                return "val"
+            if s in test_s:
+                return "test"
+            if s in train_s:
+                return "train"
+            return None
+
+        df["split_a"] = df["scaffold_a"].map(_scaffold_split)
+        df["split_b"] = df["scaffold_b"].map(_scaffold_split)
+
+        # Drop any pair whose two ligands' scaffolds fall into different
+        # splits — this prevents leakage where a scaffold appears in more
+        # than one split.
+        n_before = len(df)
+        df = df[df["split_a"] == df["split_b"]].reset_index(drop=True)
+        n_dropped = n_before - len(df)
+        df["split"] = df["split_a"]
+        df = df.drop(columns=["scaffold_a", "scaffold_b", "split_a", "split_b"])
+
+        print(f"    Dropped {n_dropped:,} pairs straddling scaffold splits "
+              f"({n_dropped / n_before:.1%})")
+    else:
+        print(f"\n[1.3] Split method: ligand_a (legacy), grouping by ligand A only")
+
+        # Grouped split by smi_a
+        groups = df[SMILES_A_COLUMN].unique()
+        rng = np.random.default_rng(args.seed)
+        rng.shuffle(groups)
+        n = len(groups)
+        n_val  = max(1, int(n * args.val_frac))
+        n_test = max(1, int(n * args.test_frac))
+        val_g  = set(groups[n - n_val - n_test : n - n_test])
+        test_g = set(groups[n - n_test :])
+
+        df["split"] = "train"
+        df.loc[df[SMILES_A_COLUMN].isin(val_g),  "split"] = "val"
+        df.loc[df[SMILES_A_COLUMN].isin(test_g), "split"] = "test"
+
+    print(f"\n[1.4] Split: "
           f"train={( df.split=='train').sum():,}  "
           f"val={(df.split=='val').sum():,}  "
           f"test={(df.split=='test').sum():,}")

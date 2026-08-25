@@ -132,6 +132,11 @@ def parse_args():
                    help="Passed through to hto.phase1_load, which requires it.")
     p.add_argument("--test_frac",     type=float, default=0.1,
                    help="Passed through to hto.phase1_load, which requires it.")
+    p.add_argument("--split_method",  choices=["ligand_a", "scaffold"], default="scaffold",
+                   help="Passed through to hto.phase1_load. 'ligand_a' (legacy): "
+                        "group only by ligand-A identity — ligand B can leak "
+                        "across splits. 'scaffold' (default): group by "
+                        "Bemis-Murcko scaffold to prevent leakage.")
     p.add_argument("--hidden_dim",    type=int, default=128)
     p.add_argument("--num_layers",    type=int, default=4)
     p.add_argument("--embed_dim",     type=int, default=128)
