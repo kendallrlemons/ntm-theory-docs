@@ -130,18 +130,24 @@ The *less* transformation-aware / more B-isolated the architecture, the *better*
 
 ## 6. Planned fix and path forward
 
-### 6.1 Fix the split
+### 6.1 Fix the split — now implemented, splitting by Bemis-Murcko scaffold
 
-Group by the union of ligand identities appearing in *either* column, so no ligand — A or B — appears in more than one split:
+Rather than grouping by raw ligand identity, we now group by **Bemis-Murcko scaffold**, computed across the union of ligand identities appearing in *either* column, so no scaffold — under ligand A or B — appears in more than one split:
 
 ```python
-all_ligands = pd.concat([df[SMILES_A_COLUMN], df[SMILES_B_COLUMN]]).unique()
-# shuffle / partition all_ligands into train/val/test ligand sets, then
-# assign a pair to a split only if BOTH endpoints fall in that split's ligand set
-# (pairs straddling two splits get dropped)
+all_smiles = pd.concat([df[SMILES_A_COLUMN], df[SMILES_B_COLUMN]]).unique()
+scaffold_of = {smi: MurckoScaffold.MurckoScaffoldSmiles(smi=smi) for smi in all_smiles}
+df["scaffold_a"] = df[SMILES_A_COLUMN].map(scaffold_of)
+df["scaffold_b"] = df[SMILES_B_COLUMN].map(scaffold_of)
+# shuffle unique scaffolds, greedily assign to val/test buckets sized by
+# PAIR COUNT (not scaffold count) so val_frac/test_frac reflect actual pair
+# fractions, then assign a pair to a split only if BOTH endpoints' scaffolds
+# fall in that split's scaffold set (pairs straddling two splits get dropped)
 ```
 
-This is a strictly harder generalization test (fewer eligible pairs, since both endpoints must independently land in the same split), so expect the usable dataset size to shrink somewhat.
+Scaffold-level grouping is stricter than raw-ligand grouping: molecules sharing a core scaffold but differing only in R-groups are treated as the same family, closing off a subtler leakage vector (near-duplicate ligands landing in different splits). Implemented in `hybrid_topo_rbfe.py::phase1_load` and `hypersphere_rbfe.py::phase1_characterize` behind a `--split_method {ligand_a,scaffold}` flag (default `scaffold`); `hybrid_hypersphere_rbfe.py` reuses `hto.phase1_load` and exposes the same flag.
+
+This is a strictly harder generalization test (fewer eligible pairs, since both endpoints must independently land in the same split), so expect the usable dataset size to shrink somewhat — an early run on the full dataset dropped ~19-34% of pairs as straddling splits, depending on the pair-count-weighted target sizing.
 
 ### 6.2 Re-run the six-way comparison
 
