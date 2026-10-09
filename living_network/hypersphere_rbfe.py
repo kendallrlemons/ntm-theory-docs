@@ -71,6 +71,27 @@ from sklearn.metrics import (
 
 RDLogger.DisableLog("rdApp.*")
 
+# Reuse hybrid_topo_rbfe.py's data-loading/scaffold-split logic rather than
+# maintaining a second, independently-drifting copy of it. Historically this
+# script had its own separate phase1_characterize split implementation that
+# was *supposed* to be identical to hybrid_topo_rbfe.py's phase1_load but
+# actually produced a different random partition for the same --seed (see
+# docs/hybrid_hypersphere_results.md §5.1) because its cleaning step omitted
+# hto's `SE_abs > 0` filter — a subtly different row set feeds the scaffold
+# RNG, so "same seed" did not mean "same split" across the two scripts. That
+# mismatch meant any checkpoint trained by this script could be evaluated by
+# hybrid_hypersphere_rbfe.py's Phase 5 on "test" pairs that were actually in
+# this script's own training set — a real leakage vector, confirmed when a
+# Phase-5 run scored this script's checkpoint at r=0.94 on data it scored
+# r=0.08-0.14 on under its own (honest) held-out test set. Importing hto here
+# guarantees byte-identical splits across all three scripts for the same
+# --input/--seed/--split_method/--val_frac/--test_frac/--sample_size, so
+# cross-script checkpoint comparisons in Phase 5 are no longer comparing a
+# model against data it may have trained on. hto guards its own execution
+# behind `if __name__ == "__main__":`, so importing it only runs module-level
+# setup (device detection, constants) — no training or CLI parsing happens.
+import hybrid_topo_rbfe as hto
+
 # =============================================================================
 # Constants & config
 # =============================================================================
@@ -270,21 +291,12 @@ def phase1_characterize(input_csv: str, output_dir: str,
     phase_dir = os.path.join(output_dir, "phase1")
     os.makedirs(phase_dir, exist_ok=True)
 
-    # ---- Load & clean ----
-    print(f"\n[1.1] Loading {input_csv} ...")
-    df = pd.read_csv(input_csv, usecols=[SMILES_A_COLUMN, SMILES_B_COLUMN, SE_COLUMN])
-    df = df.rename(columns={
-        SMILES_A_COLUMN: "smi_a",
-        SMILES_B_COLUMN: "smi_b",
-        SE_COLUMN: "SE",
-    })
-    n_raw = len(df)
-    df = df.dropna().drop_duplicates(subset=["smi_a", "smi_b"])
-    df["SE_abs"] = df["SE"].abs()
-    n_clean = len(df)
-    print(f"    Raw rows: {n_raw:,}  |  After dedup + NaN drop: {n_clean:,}")
-
-    # ---- Subsample ----
+    # ---- Load, clean & split: delegate to hto.phase1_load ----
+    # (see the module-level comment above `import hybrid_topo_rbfe as hto`
+    # for why this is no longer a separately-maintained implementation —
+    # it used to drift from hybrid_topo_rbfe.py's split despite an
+    # identical --seed, which caused cross-script leakage when checkpoints
+    # were compared in hybrid_hypersphere_rbfe.py's Phase 5.)
     try:
         sample_size = int(sample_size)
     except (TypeError, ValueError) as e:
@@ -293,9 +305,19 @@ def phase1_characterize(input_csv: str, output_dir: str,
             f"{sample_size!r}. "
             "If you set DEFAULT_SAMPLE_SIZE, use underscores (500_000), not commas (500,000)."
         ) from e
-    if sample_size > 0 and sample_size < n_clean:
-        df = df.sample(n=sample_size, random_state=seed).reset_index(drop=True)
-        print(f"    Subsampled to {len(df):,} rows (seed={seed})")
+    _shim_args = argparse.Namespace(
+        input=input_csv, sample_size=sample_size, seed=seed,
+        val_frac=val_frac, test_frac=test_frac, split_method=split_method,
+    )
+    df = hto.phase1_load(_shim_args, output_dir)
+    df = df.rename(columns={
+        SMILES_A_COLUMN: "smi_a",
+        SMILES_B_COLUMN: "smi_b",
+        SE_COLUMN: "SE",
+    })
+    print(f"\n[1.1] Loaded & split {len(df):,} cleaned pairs via hto.phase1_load "
+          f"(train={(df.split=='train').sum():,}  val={(df.split=='val').sum():,}  "
+          f"test={(df.split=='test').sum():,})")
 
     # ---- SE distribution ----
     print("\n[1.2] SE distribution:")
@@ -499,91 +521,10 @@ def phase1_characterize(input_csv: str, output_dir: str,
     )
     fig_scatter.write_html(os.path.join(phase_dir, "descriptor_scatter_interactive.html"))
 
-    # ---- Split train/val/test ----
-    if split_method == "scaffold":
-        print("\n[1.5] Splitting train/val/test (Bemis-Murcko scaffold, "
-              "grouping by both ligands to avoid leakage)")
-
-        all_smiles = pd.unique(pd.concat([df["smi_a"], df["smi_b"]], ignore_index=True))
-        scaffold_of = {}
-        for smi in all_smiles:
-            try:
-                scaffold_of[smi] = MurckoScaffold.MurckoScaffoldSmiles(smi=smi)
-            except Exception:
-                scaffold_of[smi] = smi  # fall back to full SMILES if scaffold fails
-
-        df["scaffold_a"] = df["smi_a"].map(scaffold_of)
-        df["scaffold_b"] = df["smi_b"].map(scaffold_of)
-
-        # Size val/test by PAIR COUNT, not scaffold count (see
-        # hybrid_topo_rbfe.py::phase1_load for the same logic/rationale).
-        degree = pd.concat([df["scaffold_a"], df["scaffold_b"]]).value_counts()
-        scaffolds = degree.index.to_numpy()
-        rng = np.random.default_rng(seed)
-        order = rng.permutation(len(scaffolds))
-        scaffolds = scaffolds[order]
-        degrees = degree.values[order]
-
-        n_pairs = len(df)
-        target_val = val_frac * n_pairs
-        target_test = test_frac * n_pairs
-
-        val_s, test_s, train_s = set(), set(), set()
-        val_deg = test_deg = 0
-        for s, d in zip(scaffolds, degrees):
-            if val_deg < target_val:
-                val_s.add(s)
-                val_deg += d
-            elif test_deg < target_test:
-                test_s.add(s)
-                test_deg += d
-            else:
-                train_s.add(s)
-
-        def _scaffold_split(s):
-            if s in val_s:
-                return "val"
-            if s in test_s:
-                return "test"
-            if s in train_s:
-                return "train"
-            return None
-
-        df["split_a"] = df["scaffold_a"].map(_scaffold_split)
-        df["split_b"] = df["scaffold_b"].map(_scaffold_split)
-
-        n_before = len(df)
-        df = df[df["split_a"] == df["split_b"]].reset_index(drop=True)
-        n_dropped = n_before - len(df)
-        df["split"] = df["split_a"]
-        df = df.drop(columns=["scaffold_a", "scaffold_b", "split_a", "split_b"])
-
-        print(f"    Dropped {n_dropped:,} pairs straddling scaffold splits "
-              f"({n_dropped / n_before:.1%})")
-    else:
-        print("\n[1.5] Splitting train/val/test (grouped by anchor smi_a to avoid leakage)")
-        unique_a = df["smi_a"].unique()
-        rng = np.random.RandomState(seed)
-        rng.shuffle(unique_a)
-        n_a = len(unique_a)
-        n_test = int(n_a * test_frac)
-        n_val = int(n_a * val_frac)
-        test_anchors = set(unique_a[:n_test])
-        val_anchors = set(unique_a[n_test:n_test + n_val])
-
-        def assign(smi_a):
-            if smi_a in test_anchors:
-                return "test"
-            if smi_a in val_anchors:
-                return "val"
-            return "train"
-        df["split"] = df["smi_a"].map(assign)
-
-    print(f"    Train: {(df.split=='train').sum():,}  "
-          f"Val: {(df.split=='val').sum():,}  "
-          f"Test: {(df.split=='test').sum():,}")
-
-    # Save split as pickle (avoids pyarrow/fastparquet dependency).
+    # ---- Split already assigned by hto.phase1_load above ----
+    # (train/val/test columns and counts were printed in [1.1]; this is just
+    # this script's own local cache copy so later phases can resume via
+    # output_dir/phase1/cleaned_split_{split_method}.pkl as before.)
     df.to_pickle(os.path.join(phase_dir, f"cleaned_split_{split_method}.pkl"))
     return df
 

@@ -1,7 +1,7 @@
 
 # Hybrid + Hypersphere Model: Results, Methodology, and the Ligand-B Leakage Issue
 
-*Status: results below are provisional — a likely train/test leakage issue in the split design (Section 4) must be fixed before these numbers can be trusted.*
+*Status: the Section 5 leakage issue has been fixed (scaffold split) and re-run on the full dataset — see §7 for real, leakage-free numbers. A second, cross-script split-mismatch leakage bug was found and fixed during that re-run (§7.3); `hypersphere_rbfe.py` needs one more re-run under the fix before any new six-way table can be trusted.*
 
 ---
 
@@ -161,3 +161,69 @@ Re-run Phase 3 (combined model retraining) and Phase 5 (comparison) under the co
 
 - **Isolate whether the reformulated contrastive loss helps or hurts** the combined model specifically, by training with `--w_contrastive 0` (dispersion + regression only) and comparing to the current combined result (r=0.604) and the ablation (r=0.290).
 - **Investigate the mechanism gap** between the independent hypersphere approach and the merged-graph hybrid approach in general — even after fixing the split, understanding *why* keeping A and B as two separate embeddings outperforms merging them into one transformation-aware graph is itself a useful modeling question.
+
+---
+
+## 7. Week 1 run log (cluster, A40) — actual scaffold-split results
+
+All three runs below used `--split_method scaffold` (the now-default), `--seed 42`, and the full dataset (`compound_smiles_stderr_differences.csv`, 13.1M raw rows → 2,965,607 cleaned pairs). This section records the real numbers produced and a second leakage issue discovered (and fixed) while generating them.
+
+### 7.1 `hypersphere_rbfe.py` (independent encoder), standalone
+
+- Phase 1 go/no-go gate: **PASS** (6/10 descriptors matched chemical intuition, need ≥2). Scaffold split dropped 551,314 pairs (18.6%) straddling train/val/test. Train 2,399,294 / Val 7,477 / Test 7,522.
+- Phase 3 training: early-stopped at epoch 16; val Spearman ρ peaked at epoch 6 (**0.232**) and drifted down afterward — loss-term imbalance (dispersion term `d≈0.27–0.28` dwarfing the regression term `r≈0.006`) is a plausible cause, flagged for the §6.3 `--w_contrastive 0` follow-up.
+- Phase 4/5 (own honest held-out test, n=7,522):
+
+  | Method | Pearson r | AUROC (hard top-25%) |
+  |---|---|---|
+  | Tanimoto (1-sim) | -0.034 (p=0.0032) | 0.479 |
+  | LOMAP-like (1-sim) | -0.034 (p=0.0031) | 0.480 |
+  | NTM cross-cluster OOD | 0.100 | 0.549 |
+  | NTM max-individual OOD | 0.141 | 0.517 |
+  | NTM regression head | 0.080 | 0.542 |
+
+  **This is the real, leakage-free number for this architecture: r≈0.08–0.14, AUROC≈0.52–0.55 (barely above chance on hard-pair discrimination).** A ~90% relative collapse from the old r≈0.91 headline, confirming leakage was the dominant driver of that number.
+
+### 7.2 `hybrid_topo_rbfe.py` (merged MCS graph), standalone
+
+Required a separate parallel MCS-precompute pass (`mcs_precompute.py`, multiprocessing) before training, since the script's own inline `--precompute` path is a serial loop and infeasible at 2.4M pairs.
+
+  | Method | Pearson r | AUROC (hard top-25%) |
+  |---|---|---|
+  | Tanimoto (1-sim) | -0.019 (p=0.18, **n.s.**) | 0.483 |
+  | LOMAP (real, 1-sim) | 0.023 (p=0.11, **n.s.**) | 0.499 |
+  | Hybrid-topo GNN | **0.064** (p<0.0001) | 0.549 |
+
+  Notable: both baselines are statistically indistinguishable from noise on the honest test set, while the GNN's small effect size is nonetheless highly significant — real evidence that a learned representation captures something cheap heuristics don't, even though the absolute effect size is modest.
+
+  **Open question for Week 4:** this architecture's relative collapse from its old leaky number (r=0.523 → 0.064, ~88% relative drop) is roughly the same magnitude as the independent hypersphere model's collapse (~85–91%), even though the hybrid design was specifically expected to be *less* exploitable by the diagnosed ligand-B-isolation leakage mechanism (§5.2–5.3). This suggests either (a) leakage in the old `ligand_a` split was broader than the specific mechanism diagnosed, inflating all architectures roughly proportionally, or (b) the real achievable ceiling on this dataset under an honest split is simply low (~r=0.1) and roughly architecture-independent — consistent with AUROC_hard landing at ~0.55 for every architecture tested so far regardless of design. Needs revisiting once the combined model's honest number (§7.3, re-run) is in.
+
+### 7.3 `hybrid_hypersphere_rbfe.py` six-way comparison — cross-script split-mismatch leakage (found and fixed)
+
+First six-way run produced:
+
+  | Method | Pearson r | AUROC (hard top-25%) |
+  |---|---|---|
+  | Tanimoto (1-sim) | -0.087 (p<0.0001) | 0.440 |
+  | LOMAP (real, 1-sim) | 0.034 (p=0.0002) | 0.504 |
+  | **Hypersphere (independent)** | **0.938** | **0.973** |
+  | MCS/GNN (independent) | 0.014 (p=0.12, n.s.) | 0.528 |
+  | Hybrid + L2-norm (ablation) | **0.149** | 0.594 |
+  | Hybrid + Hypersphere (combined) | **0.117** | 0.580 |
+
+**The r=0.938 "Independent hypersphere" row is not real — it is a second, distinct leakage bug, not a resurrection of genuine signal.** Root cause: `hybrid_hypersphere_rbfe.py` and `hybrid_topo_rbfe.py` both split via the shared `hto.phase1_load`, so the "MCS/GNN independent" arm is evaluated on that same model's genuine held-out test set (and scores a consistent, low, honest r=0.014). But `hypersphere_rbfe.py` previously had its **own separate** `phase1_characterize` split implementation that was supposed to be algorithmically identical (same scaffold-grouping logic, same RNG) but silently omitted hto's `df[df.SE_abs > 0]` filter. That one missing filter changes the exact row set feeding the scaffold-degree RNG, so **the same `--seed` produced a different train/val/test partition in the two scripts** — meaning a `hypersphere_rbfe.py` checkpoint evaluated against `hybrid_hypersphere_rbfe.py`'s test set was partly being scored on its own training data. This is confirmed by the fact that the same checkpoint scored r≈0.08–0.14 on its own honest test set (§7.1) just hours earlier.
+
+**Trustworthy numbers from this run** (both trained *and* evaluated under this script's own consistent `hto.phase1_load` split): **Hybrid + L2-norm ablation r=0.149**, **Hybrid + Hypersphere combined r=0.117** — both currently the best legitimate signal found on this dataset, and both clearly ahead of the baselines' near-null correlations.
+
+**Fix applied:** `hypersphere_rbfe.py` now imports `hybrid_topo_rbfe` as `hto` and delegates its Phase 1 loading/cleaning/splitting entirely to `hto.phase1_load`, guaranteeing a byte-identical split across all three scripts for the same `--input/--seed/--split_method/--val_frac/--test_frac/--sample_size` — eliminating this class of leakage by construction rather than by keeping two hand-written implementations in sync. **`hypersphere_rbfe.py` needs to be re-run** (Phase 1 onward — the cached `phase1/cleaned_split_scaffold.pkl` is now stale and will be regenerated) before any new six-way table is produced or any checkpoint comparison is trusted.
+
+### 7.4 Secondary finding: Tanimoto similarity correlates the "wrong" way
+
+Across all three runs above, `Tanimoto (1-sim)` (dissimilarity) correlates **negatively** with `|SE|` (-0.034, -0.019, -0.087) — i.e., more *dissimilar* ligand pairs look slightly *easier* in this dataset, the opposite of the standard RBFE assumption. This is consistent with Phase 1's go/no-go gate, where raw `tanimoto_morgan` similarity showed r=+0.0385 with `|SE|` (also opposite the sign the gate's own documentation expects). The pattern has now replicated three times with growing significance as n increases, so it looks like a real, if counterintuitive, property of this dataset rather than noise — worth a dedicated look before Week 4's baseline writeup, since it may indicate a selection effect in how perturbation edges were originally drawn (e.g., edges are typically proposed between *similar* ligands by design, which could induce this kind of inversion).
+
+### 7.5 Status / next actions
+
+1. Re-run `hypersphere_rbfe.py` end-to-end under the fixed shared-split code.
+2. Re-run `hybrid_hypersphere_rbfe.py`'s Phase 5 six-way comparison with the corrected checkpoint to get a trustworthy "Independent hypersphere" number.
+3. Revisit the "why did every architecture collapse by roughly the same proportion" question (§7.2) once that number is in — it determines whether Week 4's ablation story is about *architecture* differences or a *shared data ceiling*.
+4. Carry the `--w_contrastive 0` and loss-term-rebalancing follow-ups from §6.3 forward — current training curves (§7.1) suggest the regression signal may be getting crowded out by the dispersion term.
