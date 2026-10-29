@@ -69,6 +69,8 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 
+import rbfe_artifacts as artifacts
+
 RDLogger.DisableLog("rdApp.*")
 
 # Reuse hybrid_topo_rbfe.py's data-loading/scaffold-split logic rather than
@@ -847,6 +849,7 @@ def _build_loader(df, args, shuffle):
 def phase3_train(df: pd.DataFrame, args, output_dir: str,
                  run_name: str = "hypersphere") -> Dict:
     """Train the hypersphere encoder (Option C hybrid). Returns ckpt paths."""
+    args.benchmark = artifacts.benchmark_identity(df)
     print("\n" + "=" * 70)
     print(f"PHASE 3 — Hypersphere Encoder Training ({run_name})")
     print("=" * 70)
@@ -989,6 +992,7 @@ def phase3_train(df: pd.DataFrame, args, output_dir: str,
                 "args": vars(args),
                 "se_scale": se_scale,
                 "l2_normalize": l2,
+                "benchmark": args.benchmark,
             }, best_ckpt)
             patience = 0
         else:
@@ -1016,6 +1020,7 @@ def phase3_train(df: pd.DataFrame, args, output_dir: str,
 
 def _load_model(ckpt_path: str, args):
     ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+    artifacts.require_benchmark(ckpt, getattr(args, "benchmark", None))
     l2 = ckpt["l2_normalize"]
     encoder = HypersphereEncoder(
         ATOM_DIM, BOND_DIM, args.hidden_dim, args.num_layers,
@@ -1050,6 +1055,7 @@ def _encode_all(encoder, head, clusters, loader):
 
 def phase4_validate(df: pd.DataFrame, args, ckpt_info: Dict,
                     output_dir: str, name: str = "hypersphere") -> Dict:
+    args.benchmark = artifacts.benchmark_identity(df)
     print("\n" + "=" * 70)
     print(f"PHASE 4 — Geometric Validation ({name})")
     print("=" * 70)
@@ -1360,6 +1366,7 @@ def _lomap_like_score(smi_a, smi_b):
 
 def phase5_baselines(df: pd.DataFrame, args, ckpt_info: Dict,
                      output_dir: str) -> Dict:
+    args.benchmark = artifacts.benchmark_identity(df)
     print("\n" + "=" * 70)
     print("PHASE 5 — Baseline Comparison")
     print("=" * 70)
@@ -1510,11 +1517,14 @@ def main():
                                   val_frac=args.val_frac, test_frac=args.test_frac,
                                   split_method=args.split_method)
     else:
-        p1_pkl = os.path.join(args.output_dir, "phase1",
-                               f"cleaned_split_{args.split_method}.pkl")
-        if os.path.exists(p1_pkl):
-            print(f"Loading Phase 1 artifact from {p1_pkl}")
-            df = pd.read_pickle(p1_pkl)
+        df = hto.phase1_load(args, args.output_dir).rename(columns={
+            SMILES_A_COLUMN: "smi_a",
+            SMILES_B_COLUMN: "smi_b",
+            SE_COLUMN: "SE",
+        })
+    benchmark = artifacts.benchmark_identity(df)
+    with open(os.path.join(args.output_dir, "benchmark.json"), "w") as f:
+        json.dump(benchmark, f, indent=2, sort_keys=True)
 
     # Phase 2 is implicit (graph featurization happens inside Dataset construction).
     if 2 in phases:

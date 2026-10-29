@@ -43,8 +43,8 @@ transformations with very different difficulty should be far apart. Dispersion
 
 Phases
 ------
-1. Data loading & split (reuses hybrid_topo_rbfe.phase1_load for exact index
-   alignment with the cached graphs_all.pt from mcs_precompute.py).
+1. Data loading & split (reuses hybrid_topo_rbfe.phase1_load for a shared
+   split; graph caches are aligned by ordered pair keys).
 2. Train ablation model: hybrid encoder + L2-norm + regression-only.
 3. Train combined model: hybrid encoder + L2-norm + full 3-component loss.
 4. Geometric validation of the combined model (OOD score / regression vs |SE|,
@@ -99,6 +99,8 @@ from sklearn.metrics import (
     mean_absolute_error,
     roc_auc_score,
 )
+
+import rbfe_artifacts as artifacts
 
 # Reuse code from the two parent scripts rather than duplicating it. Both
 # modules guard their own execution behind `if __name__ == "__main__":`, so
@@ -220,6 +222,7 @@ def train_model(df: pd.DataFrame, args, output_dir: str,
     model). If False, trains with regression loss only (the "ablation":
     isolates whether L2-normalizing the hybrid embedding alone helps).
     """
+    args.benchmark = artifacts.benchmark_identity(df)
     print("\n" + "=" * 70)
     print(f"PHASE — Training ({run_name})")
     print("=" * 70)
@@ -227,8 +230,6 @@ def train_model(df: pd.DataFrame, args, output_dir: str,
     phase_dir = os.path.join(output_dir, f"phase_{run_name}")
     os.makedirs(phase_dir, exist_ok=True)
 
-    train_orig = df[df.split == "train"].index
-    val_orig   = df[df.split == "val"].index
     train_df   = df[df.split == "train"].reset_index(drop=True)
     val_df     = df[df.split == "val"].reset_index(drop=True)
 
@@ -238,8 +239,12 @@ def train_model(df: pd.DataFrame, args, output_dir: str,
         if args.graph_cache_dir
         else os.path.join(output_dir, "phase2_hybrid")
     )
-    train_graphs = hto._load_graphs("train", phase2_dir, df_index=train_orig)
-    val_graphs   = hto._load_graphs("val",   phase2_dir, df_index=val_orig)
+    train_graphs = hto._load_graphs(
+        "train", phase2_dir, pair_df=train_df, mcs_timeout=args.mcs_timeout,
+    )
+    val_graphs = hto._load_graphs(
+        "val", phase2_dir, pair_df=val_df, mcs_timeout=args.mcs_timeout,
+    )
     _, train_loader = hto._build_loader(train_df, args, shuffle=True,  graphs=train_graphs)
     _, val_loader   = hto._build_loader(val_df,   args, shuffle=False, graphs=val_graphs)
 
@@ -360,6 +365,7 @@ def train_model(df: pd.DataFrame, args, output_dir: str,
                 "args": vars(args),
                 "se_scale": se_scale,
                 "use_hyperspherical_losses": use_hyperspherical_losses,
+                "benchmark": args.benchmark,
             }
             if use_hyperspherical_losses:
                 ckpt["clusters"] = clusters.state_dict()
@@ -384,6 +390,7 @@ def train_model(df: pd.DataFrame, args, output_dir: str,
 
 def _load_combined_model(ckpt_path: str, args):
     ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+    artifacts.require_benchmark(ckpt, getattr(args, "benchmark", None))
     encoder = hto.HybridGNN(
         hto.ATOM_DIM, hto.BOND_DIM, args.hidden_dim, args.num_layers,
         args.embed_dim, args.dropout,
@@ -420,6 +427,7 @@ def _encode_all_combined(encoder, loader) -> Tuple[np.ndarray, np.ndarray, np.nd
 # =============================================================================
 
 def phase4_validate(df: pd.DataFrame, args, ckpt_info: Dict, output_dir: str) -> Dict:
+    args.benchmark = artifacts.benchmark_identity(df)
     print("\n" + "=" * 70)
     print("PHASE 4 — Geometric Validation (combined model)")
     print("=" * 70)
@@ -433,14 +441,15 @@ def phase4_validate(df: pd.DataFrame, args, ckpt_info: Dict, output_dir: str) ->
               "losses (no cluster centers). Run Phase 4 on the combined model.")
         return {}
 
-    test_orig = df[df.split == "test"].index
     test_df   = df[df.split == "test"].reset_index(drop=True)
     phase2_dir = (
         args.graph_cache_dir
         if args.graph_cache_dir
         else os.path.join(output_dir, "phase2_hybrid")
     )
-    test_graphs = hto._load_graphs("test", phase2_dir, df_index=test_orig)
+    test_graphs = hto._load_graphs(
+        "test", phase2_dir, pair_df=test_df, mcs_timeout=args.mcs_timeout,
+    )
     _, test_loader = hto._build_loader(test_df, args, shuffle=False, graphs=test_graphs)
 
     print("\n[4.1] Encoding test set")
@@ -604,6 +613,7 @@ def _predict_hypersphere_aligned(eval_df: pd.DataFrame, encoder, head,
 
 def phase5_compare(df: pd.DataFrame, args, ablation_ckpt: Dict,
                    combined_ckpt: Dict, output_dir: str) -> Dict:
+    args.benchmark = artifacts.benchmark_identity(df)
     print("\n" + "=" * 70)
     print("PHASE 5 — Six-Way Comparison")
     print("=" * 70)
@@ -616,8 +626,6 @@ def phase5_compare(df: pd.DataFrame, args, ablation_ckpt: Dict,
     n_eval   = min(20_000, len(test_df))
     eval_pos = test_df.sample(n=n_eval, random_state=args.seed).index
     eval_df  = test_df.loc[eval_pos].reset_index(drop=True)
-    test_orig = df[df.split == "test"].index
-    eval_orig = test_orig[eval_pos]
     Y_true = eval_df["SE_abs"].values.astype(np.float64)
     print(f"    Evaluating on {n_eval:,} test pairs (shared across all methods)")
 
@@ -640,7 +648,9 @@ def phase5_compare(df: pd.DataFrame, args, ablation_ckpt: Dict,
         if args.graph_cache_dir
         else os.path.join(output_dir, "phase2_hybrid")
     )
-    eval_graphs = hto._load_graphs("test", phase2_dir, df_index=eval_orig)
+    eval_graphs = hto._load_graphs(
+        "test", phase2_dir, pair_df=eval_df, mcs_timeout=args.mcs_timeout,
+    )
     if eval_graphs is None:
         raise RuntimeError(
             "No cached graphs found. Set --graph_cache_dir to the output of "
@@ -655,6 +665,9 @@ def phase5_compare(df: pd.DataFrame, args, ablation_ckpt: Dict,
             args.embed_dim, args.dropout,
         ).to(DEVICE)
         hybrid_ckpt = torch.load(args.hybrid_ckpt, map_location=DEVICE, weights_only=False)
+        artifacts.require_benchmark(
+            hybrid_ckpt, getattr(args, "benchmark", None),
+        )
         hybrid_model.load_state_dict(hybrid_ckpt["model"])
         hybrid_model.eval()
         pred_mcs = _predict_aligned(eval_graphs, Y_true, hybrid_model, args.batch_size)
@@ -779,9 +792,12 @@ def main():
     ablation_ckpt = None
     combined_ckpt = None
 
-    # Phase 1: reuse hybrid_topo_rbfe.py's loader for exact index alignment
-    # with the cached graphs_all.pt.
+    # Phase 1: reuse hybrid_topo_rbfe.py's loader for a shared split; graph
+    # caches are aligned by ordered pair keys.
     df = hto.phase1_load(args, args.output_dir)
+    benchmark = artifacts.benchmark_identity(df)
+    with open(os.path.join(args.output_dir, "benchmark.json"), "w") as f:
+        json.dump(benchmark, f, indent=2, sort_keys=True)
 
     if 2 in phases:
         ablation_ckpt = train_model(df, args, args.output_dir,

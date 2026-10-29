@@ -9,15 +9,15 @@ model training, so it can be parallelized independently (e.g. SLURM array)
 and reused across many training runs without recomputing.
 
 Output (saved to --output_dir):
-    cleaned_split.pkl          — cleaned DataFrame with split column
-    graphs_train.pt            — list of graph dicts (or None) for train rows
-    graphs_val.pt              — list of graph dicts (or None) for val rows
-    graphs_test.pt             — list of graph dicts (or None) for test rows
+    cleaned.pkl                — cleaned DataFrame with a cache manifest
+    graphs_all.pt              — versioned graph bundle keyed by ordered SMILES
 
     If --num_chunks > 1:
-    graphs_{split}_chunk{K}_of_{N}.pt  — partial files, merged at the end
+    graphs_all_chunk{K}_of_{N}.pt     — keyed partial bundles, merged at the end
 
-These files are directly loadable by hybrid_topo_rbfe.py's _load_graphs().
+The graph bundles contain the graphs, ordered pair keys, featurization version,
+and MCS timeout. They are directly loadable by hybrid_topo_rbfe.py's
+_load_graphs().
 
 Usage — single process (small dataset or test run):
     python mcs_precompute.py --input data.csv --output_dir ./graphs
@@ -49,6 +49,8 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import pandas as pd
 import torch
+
+import rbfe_artifacts as artifacts
 
 from rdkit import Chem, RDLogger
 from rdkit.Chem import rdFMCS
@@ -283,8 +285,12 @@ def _init_worker(timeout: int):
 def load_and_clean(input_path: str, output_dir: str,
                    sample_size: int, seed: int) -> pd.DataFrame:
     pkl = os.path.join(output_dir, "cleaned.pkl")
+    request = artifacts.data_request(
+        input_path, sample_size=int(sample_size), seed=seed,
+    )
     if os.path.exists(pkl):
         print(f"[data] Loading cached cleaned df from {pkl}", flush=True)
+        artifacts.require_cache_manifest(pkl, request)
         return pd.read_pickle(pkl)
 
     print(f"[data] Loading {input_path} ...", flush=True)
@@ -302,6 +308,7 @@ def load_and_clean(input_path: str, output_dir: str,
         print(f"[data] Subsampled to {sample_size:,}", flush=True)
 
     df.to_pickle(pkl)
+    artifacts.write_cache_manifest(pkl, request)
     print(f"[data] Saved cleaned df ({len(df):,} rows) to {pkl}", flush=True)
     return df
 
@@ -341,6 +348,10 @@ def precompute_all(df: pd.DataFrame, output_dir: str,
 
     if os.path.exists(out_path):
         print(f"[precompute] Cache hit — {out_path}", flush=True)
+        payload = torch.load(out_path, weights_only=False)
+        artifacts.validate_graph_bundle(payload, mcs_timeout)
+        if payload["pair_keys"] != pairs:
+            raise ValueError("Graph cache pair order mismatch")
         return out_path
 
     print(f"[precompute] Computing {label} with {num_workers} workers ...", flush=True)
@@ -459,7 +470,7 @@ def precompute_all(df: pd.DataFrame, output_dir: str,
         print(f"[precompute] Uniq atoms: mean={np.mean(uniqs):.1f}  "
               f"min={min(uniqs)}  max={max(uniqs)}", flush=True)
 
-    torch.save(graphs, out_path)
+    torch.save(artifacts.graph_bundle(graphs, pairs, mcs_timeout), out_path)
     gb = os.path.getsize(out_path) / 1e9
     print(f"[precompute] Saved → {out_path} ({gb:.2f} GB)", flush=True)
     return out_path
@@ -470,13 +481,30 @@ def precompute_all(df: pd.DataFrame, output_dir: str,
 # =============================================================================
 
 def merge_chunks(output_dir: str, num_chunks: int):
+    if num_chunks <= 0:
+        raise ValueError("num_chunks must be positive")
     out_path = os.path.join(output_dir, "graphs_all.pt")
+    cleaned_path = os.path.join(output_dir, "cleaned.pkl")
+    if not os.path.exists(cleaned_path):
+        raise FileNotFoundError(f"Missing cleaned data file: {cleaned_path}")
+    df = pd.read_pickle(cleaned_path)
+    expected_keys = artifacts.pair_keys(df)
+    chunk_size = int(np.ceil(len(expected_keys) / num_chunks))
     if os.path.exists(out_path):
-        print(f"[merge] Already exists: {out_path}", flush=True)
+        payload = torch.load(out_path, weights_only=False)
+        artifacts.validate_graph_bundle(
+            payload,
+            payload.get("mcs_timeout") if isinstance(payload, dict) else None,
+        )
+        if payload["pair_keys"] != expected_keys:
+            raise ValueError("Merged graph cache pair order mismatch")
+        print(f"[merge] Validated existing cache: {out_path}", flush=True)
         return
 
     print(f"[merge] Merging {num_chunks} chunks into graphs_all.pt ...", flush=True)
     merged = []
+    merged_keys = []
+    mcs_timeout = None
     for k in range(num_chunks):
         chunk_path = os.path.join(
             output_dir, f"graphs_all_chunk{k}_of_{num_chunks}.pt"
@@ -487,10 +515,26 @@ def merge_chunks(output_dir: str, num_chunks: int):
                 f"Make sure all {num_chunks} array tasks completed successfully."
             )
         chunk = torch.load(chunk_path, weights_only=False)
-        merged.extend(chunk)
-        print(f"  chunk {k}: {len(chunk):,} graphs (running total: {len(merged):,})", flush=True)
+        if k == 0:
+            artifacts.validate_graph_bundle(
+                chunk,
+                chunk.get("mcs_timeout") if isinstance(chunk, dict) else None,
+            )
+            mcs_timeout = chunk["mcs_timeout"]
+        else:
+            artifacts.validate_graph_bundle(chunk, mcs_timeout)
+        chunk_keys = expected_keys[k * chunk_size:min((k + 1) * chunk_size,
+                                                       len(expected_keys))]
+        if chunk["pair_keys"] != chunk_keys:
+            raise ValueError(f"Graph cache pair order mismatch in chunk {k}")
+        merged.extend(chunk["graphs"])
+        merged_keys.extend(chunk["pair_keys"])
+        print(f"  chunk {k}: {len(chunk['graphs']):,} graphs "
+              f"(running total: {len(merged):,})", flush=True)
 
-    torch.save(merged, out_path)
+    if merged_keys != expected_keys:
+        raise ValueError("Merged graph cache pair order mismatch")
+    torch.save(artifacts.graph_bundle(merged, merged_keys, mcs_timeout), out_path)
     gb = os.path.getsize(out_path) / 1e9
     print(f"[merge] Saved → {out_path} ({gb:.2f} GB, {len(merged):,} graphs)", flush=True)
 

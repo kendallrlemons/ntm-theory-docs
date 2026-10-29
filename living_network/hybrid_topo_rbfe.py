@@ -32,6 +32,7 @@ Edit the CONFIG block below or pass CLI overrides.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import pickle
 import random
@@ -61,6 +62,8 @@ from sklearn.metrics import (
     matthews_corrcoef,
     roc_auc_score,
 )
+
+import rbfe_artifacts as artifacts
 
 RDLogger.DisableLog("rdApp.*")
 
@@ -432,6 +435,8 @@ class HybridPairDataset(Dataset):
 class PrecomputedHybridDataset(Dataset):
     """Wraps a pre-built list of graph dicts (parallel to df rows)."""
     def __init__(self, graphs: list, df: pd.DataFrame):
+        if len(graphs) != len(df):
+            raise ValueError("Graph/label length mismatch")
         self.graphs = graphs
         self.df = df.reset_index(drop=True)
 
@@ -452,10 +457,12 @@ class PrecomputedHybridDataset(Dataset):
 def precompute_graphs(df: pd.DataFrame, split: str, args, phase_dir: str) -> str:
     """Build all hybrid graphs for one split once and save to disk."""
     out_path = os.path.join(phase_dir, f"graphs_{split}.pt")
+    split_df = df[df.split == split].reset_index(drop=True)
     if os.path.exists(out_path):
         print(f"    [cache hit] {out_path}")
+        _load_graphs(split, phase_dir, pair_df=split_df,
+                     mcs_timeout=args.mcs_timeout)
         return out_path
-    split_df = df[df.split == split].reset_index(drop=True)
     graphs, t0 = [], time.time()
     for i, row in split_df.iterrows():
         if i % 10_000 == 0:
@@ -465,34 +472,23 @@ def precompute_graphs(df: pd.DataFrame, split: str, args, phase_dir: str) -> str
             build_hybrid_graph(row[SMILES_A_COLUMN], row[SMILES_B_COLUMN],
                                args.mcs_timeout)
         )
-    torch.save(graphs, out_path)
+    torch.save(artifacts.graph_bundle(
+        graphs, artifacts.pair_keys(split_df), args.mcs_timeout,
+    ), out_path)
     gb = os.path.getsize(out_path) / 1e9
     print(f"    Saved {len(graphs):,} {split} graphs → {out_path} ({gb:.2f} GB)")
     return out_path
 
 
-def _load_graphs(split: str, phase2_dir: str,
-                 df_index=None) -> Optional[list]:
-    """Return a graph list for the given split, or None if no cache exists.
-
-    Checks two locations in order:
-    1. graphs_all.pt (produced by mcs_precompute.py) — sliced by df_index.
-    2. graphs_{split}.pt (legacy per-split files).
-    """
-    all_path   = os.path.join(phase2_dir, "graphs_all.pt")
-    split_path = os.path.join(phase2_dir, f"graphs_{split}.pt")
-
-    if os.path.exists(all_path):
-        print(f"    Loading graphs_all.pt and slicing for {split} ...")
-        all_graphs = torch.load(all_path, weights_only=False)
-        if df_index is None:
-            return all_graphs
-        return [all_graphs[i] for i in df_index]
-
-    if os.path.exists(split_path):
-        print(f"    Loading precomputed {split} graphs from {split_path} ...")
-        return torch.load(split_path, weights_only=False)
-
+def _load_graphs(split: str, phase2_dir: str, *, pair_df,
+                 mcs_timeout: int) -> Optional[list]:
+    for filename in ("graphs_all.pt", f"graphs_{split}.pt"):
+        path = os.path.join(phase2_dir, filename)
+        if os.path.exists(path):
+            payload = torch.load(path, weights_only=False)
+            return artifacts.aligned_graphs(
+                payload, artifacts.pair_keys(pair_df), mcs_timeout,
+            )
     return None
 
 
@@ -601,9 +597,15 @@ def phase1_load(args, output_dir: str) -> pd.DataFrame:
     os.makedirs(phase_dir, exist_ok=True)
     split_method = getattr(args, "split_method", "ligand_a")
     pkl = os.path.join(phase_dir, f"cleaned_split_{split_method}.pkl")
+    request = artifacts.data_request(
+        args.input, sample_size=int(args.sample_size), seed=args.seed,
+        split_method=split_method, val_frac=args.val_frac,
+        test_frac=args.test_frac,
+    )
 
     if os.path.exists(pkl):
         print(f"    Loading cached split from {pkl}")
+        artifacts.require_cache_manifest(pkl, request)
         return pd.read_pickle(pkl)
 
     print(f"\n[1.1] Loading {args.input} ...")
@@ -725,6 +727,7 @@ def phase1_load(args, output_dir: str) -> pd.DataFrame:
           f"test={(df.split=='test').sum():,}")
 
     df.to_pickle(pkl)
+    artifacts.write_cache_manifest(pkl, request)
     return df
 
 
@@ -785,6 +788,7 @@ def phase2_check(df: pd.DataFrame, args, output_dir: str):
 # =============================================================================
 
 def phase3_train(df: pd.DataFrame, args, output_dir: str) -> str:
+    args.benchmark = artifacts.benchmark_identity(df)
     print("\n" + "=" * 70)
     print("PHASE 3 — Hybrid-Topology GNN Training")
     print("=" * 70)
@@ -792,8 +796,6 @@ def phase3_train(df: pd.DataFrame, args, output_dir: str) -> str:
     phase_dir = os.path.join(output_dir, "phase3_hybrid")
     os.makedirs(phase_dir, exist_ok=True)
 
-    train_orig = df[df.split == "train"].index
-    val_orig   = df[df.split == "val"].index
     train_df   = df[df.split == "train"].reset_index(drop=True)
     val_df     = df[df.split == "val"].reset_index(drop=True)
 
@@ -803,8 +805,12 @@ def phase3_train(df: pd.DataFrame, args, output_dir: str) -> str:
         if args.graph_cache_dir
         else os.path.join(output_dir, "phase2_hybrid")
     )
-    train_graphs = _load_graphs("train", phase2_dir, df_index=train_orig)
-    val_graphs   = _load_graphs("val",   phase2_dir, df_index=val_orig)
+    train_graphs = _load_graphs(
+        "train", phase2_dir, pair_df=train_df, mcs_timeout=args.mcs_timeout,
+    )
+    val_graphs = _load_graphs(
+        "val", phase2_dir, pair_df=val_df, mcs_timeout=args.mcs_timeout,
+    )
     _, train_loader = _build_loader(train_df, args, shuffle=True,  graphs=train_graphs)
     _, val_loader   = _build_loader(val_df,   args, shuffle=False, graphs=val_graphs)
 
@@ -885,7 +891,10 @@ def phase3_train(df: pd.DataFrame, args, output_dir: str) -> str:
 
         if val_rho > best_val_rho:
             best_val_rho = val_rho
-            torch.save({"model": model.state_dict(), "args": vars(args)}, best_ckpt)
+            torch.save({
+                "model": model.state_dict(), "args": vars(args),
+                "benchmark": args.benchmark,
+            }, best_ckpt)
             patience_ctr = 0
         else:
             patience_ctr += 1
@@ -982,6 +991,7 @@ def _lomap_like_score(smi_a: str, smi_b: str, mcs_timeout: int = 5) -> float:
 
 
 def phase4_evaluate(df: pd.DataFrame, args, ckpt_path: str, output_dir: str):
+    args.benchmark = artifacts.benchmark_identity(df)
     print("\n" + "=" * 70)
     print("PHASE 4 — Evaluation vs Baselines")
     print("=" * 70)
@@ -998,6 +1008,7 @@ def phase4_evaluate(df: pd.DataFrame, args, ckpt_path: str, output_dir: str):
 
     # ---- Load model ----
     ckpt = torch.load(ckpt_path, map_location=DEVICE, weights_only=False)
+    artifacts.require_benchmark(ckpt, getattr(args, "benchmark", None))
     model = HybridGNN(
         ATOM_DIM, BOND_DIM, args.hidden_dim, args.num_layers,
         args.embed_dim, args.dropout,
@@ -1012,9 +1023,9 @@ def phase4_evaluate(df: pd.DataFrame, args, ckpt_path: str, output_dir: str):
         if args.graph_cache_dir
         else os.path.join(output_dir, "phase2_hybrid")
     )
-    test_orig   = df[df.split == "test"].index
-    eval_orig   = test_orig[eval_pos]  # correctly maps sampled rows -> original df indices
-    test_graphs = _load_graphs("test", phase2_dir, df_index=eval_orig)
+    test_graphs = _load_graphs(
+        "test", phase2_dir, pair_df=eval_df, mcs_timeout=args.mcs_timeout,
+    )
     _, loader = _build_loader(eval_df, args, shuffle=False, graphs=test_graphs)
     all_preds, all_true = [], []
     with torch.no_grad():
@@ -1152,15 +1163,11 @@ def main():
     print(f"Phases: {phases}", flush=True)
     print(f"Output: {args.output_dir}", flush=True)
 
-    df      = None
+    df      = phase1_load(args, args.output_dir)
+    benchmark = artifacts.benchmark_identity(df)
+    with open(os.path.join(args.output_dir, "benchmark.json"), "w") as f:
+        json.dump(benchmark, f, indent=2, sort_keys=True)
     ckpt    = None
-
-    if 1 in phases:
-        df = phase1_load(args, args.output_dir)
-    else:
-        pkl = os.path.join(args.output_dir, "phase1_hybrid", "cleaned_split.pkl")
-        if os.path.exists(pkl):
-            df = pd.read_pickle(pkl)
 
     if 2 in phases:
         if df is None:
