@@ -1,0 +1,19 @@
+{
+  "version": "protected-campaign-allocation-v1",
+  "status": "specified_not_executed_pending_raw_work_audit",
+  "objective": "Same mean production-stage variance proxy and separate pilot/production cost model as campaign-production-allocation-v1; no claim that pilot work can yet be pooled into the final estimator.",
+  "primary_production_unit_cost": 1.0,
+  "minimum_production_effort": 1.0,
+  "total_budget_multiples_of_pilot_cost": [1.25, 1.5, 2.0, 3.0, 5.0, 10.0],
+  "adaptive_predictors": ["pilot_only", "hypersphere_plus_pilot"],
+  "uniform_fraction_candidates": [0.25, 0.5, 0.75, 1.0],
+  "allocation": "For available production effort R and N edges, floor=max(1, alpha*R/N); solve n_i=max(floor, lambda*w_i), sum n_i=R. Infeasible if R<N. Pilot cost is deducted before R is computed.",
+  "fallback": "Uniform allocation without buying a pilot is an explicit candidate for each phase and budget.",
+  "selection": "Per phase and budget, choose predictor/alpha or uniform fallback minimizing mean variance proxy on the frozen validation campaign only. No strict-test targets, diagnostics or edge membership may enter selection.",
+  "tie_breaking": "Within 1e-12 relative risk: prefer uniform fallback, then learned pilot-only, then hypersphere; within an adaptive predictor prefer the larger uniform fraction.",
+  "training": "First protection ablation reuses frozen predictors. A squared-spread/RMS predictor requires a separately specified training experiment.",
+  "diagnostic_rules": "No BAR-overlap cutoff or case-specific exception is introduced here. Audit case IDs are never allocation features or exclusion rules.",
+  "comparison": "Retain unprotected allocations as historical controls; alpha=0 is not a selection candidate. Report all policies and the validation-selected policy.",
+  "confirmation": "The existing strict campaign is retrospective development evidence. An additional untouched campaign is needed for confirmation of this revised design.",
+  "implementation_gate": "Review source-work audit and label reliability before implementing or running validation selection."
+}

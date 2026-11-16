@@ -1,0 +1,14 @@
+{
+  "version": 1,
+  "source_sha256": "86e26cd0531e1617efca3c97da766e1bfe6ecc37d9ab97a589a8c3baafded8e1",
+  "source_bytes": 152080619,
+  "source_key": "dashboards/sprint-4/2020-09-06-ugi-tBu-x3110-3v3m-2020-04-Jacobs/analysis.json",
+  "expected_transformations": 4684,
+  "case_indices": [926, 956, 1013, 1022, 1681, 1879, 2375, 2532, 2967, 3115],
+  "case_selection": "Frozen ten complex-phase failures from the first allocation study; hypersphere_plus_pilot prediction below 0.01. Diagnostic cases only, not an exclusion rule or a predictive feature.",
+  "control_indices": [3571, 687, 2257, 343, 2302, 1882, 2456, 2061, 1288, 1971, 1889, 434, 213, 4117, 1, 2455, 501, 2597, 3923, 616],
+  "control_selection": "First 20 noncase strict-test edge IDs sorted by SHA256('raw-audit-control-v1:' + edge_id), without using outcomes.",
+  "phases": ["complex_phase", "solvent_phase"],
+  "generations": "All exported generations; identify by gen, not list position.",
+  "bar_diagnostic": "Equal-count BAR log-balance root on exported paired works, assuming forward=W_AB and reverse=W_BA in dimensionless units. No filtering or uncertainty recomputation. A diagnostic only; never replace frozen source labels."
+}

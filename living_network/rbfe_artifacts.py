@@ -13,9 +13,25 @@ import os
 
 VERSION = 1
 GRAPH_VERSION = "hybrid-mcs-v1"
+SPLIT_VERSION = "murcko-strict-v2"
+LOMAP_SCORING_VERSION = "topological-no3d-v2"
 A = "Compound Smiles 1"
 B = "Compound Smiles 2"
 Y = "Difference in first_pass_free_energy_stderr"
+
+
+def scaffold_smiles(smiles):
+    """Extract a Murcko scaffold; never substitute a ligand identity on error.
+
+    Acyclic molecules legitimately share the empty scaffold. Unexpected RDKit
+    errors propagate instead of silently changing the split semantics.
+    """
+    from rdkit import Chem
+    from rdkit.Chem.Scaffolds import MurckoScaffold
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Cannot scaffold-split invalid SMILES: {smiles!r}")
+    return MurckoScaffold.MurckoScaffoldSmiles(mol=mol)
 
 
 def file_hash(path):

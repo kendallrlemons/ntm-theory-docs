@@ -3,6 +3,13 @@
 
 *Status: all numerical results below are historical reports, not provenance-verified results. Earlier data-frame split fixes did not validate legacy graph-cache identity/order or checkpoint provenance. Treat all prior scores as provisional until the pipelines are rerun with fresh, versioned artifacts; this document preserves the historical tables without endorsing their rankings or conclusions.*
 
+**Scaffold correction:** the strict Murcko scaffold extraction fix invalidates
+the earlier claim that the v3 runs were scaffold-held-out. Those runs used
+full-SMILES grouping after an RDKit keyword error was caught and fell back;
+their scores are historical, not validated scaffold results. Do not train from
+the old v3 instructions. The immediate next steps are a fresh Phase 1 count
+check and a bounded LOMAP audit only; see §8.
+
 ---
 
 ## 1. Background
@@ -133,7 +140,10 @@ and unverified cache alignment are both possible confounders in the old runs.
 
 ---
 
-## 6. Alignment repair and rerun requirements
+## 6. Prior alignment repair plan (superseded by §8)
+
+The plan below records the earlier artifact-alignment work. Its v3 rerun
+instructions are superseded by the strict-scaffold correction in §8.
 
 The scaffold split remains the intended split rule. The earlier shared-loader fix addressed split-generation drift but left a separate graph-indexing defect: `mcs_precompute.py` stored graphs in the cleaned, pre-split row order, while `phase1_load` dropped straddling pairs and reset row indices. `_load_graphs` then used those reset indices against the original list. When this full-cache path was used after rows were dropped, graphs could receive another pair’s label. The cluster artifacts have not been inspected in this repair, so which historical runs used the affected path remains to be verified.
 
@@ -224,7 +234,158 @@ the observation after aligned reruns.
 
 ### 7.5 Status / next actions
 
+These were the earlier proposed actions and are superseded by §8; they are
+not the current recommendation.
+
 1. Rerun all models and comparisons using fresh v3 data caches, graph bundles, and checkpoints as documented in `living_network/README.md`.
 2. Audit the outputs via each run's `benchmark.json`; do not compare checkpoints unless benchmark identities match.
 3. After this repair, the next modeling stage is a descriptor-based baseline comparison against real LOMAP. That baseline is not implemented by this artifact-alignment work.
 4. Any change to the dispersion-loss/gradient behavior is deferred; the historical loss magnitudes do not justify a claim that dispersion crowded out regression.
+
+---
+
+## 8. Strict-scaffold and LOMAP diagnostic correction
+
+### 8.1 Strict scaffold extraction
+
+`MurckoScaffold.MurckoScaffoldSmiles` was called with an invalid `smi=`
+keyword in the earlier shared split implementation. The surrounding broad
+exception handling fell back to the full SMILES, so those runs were
+ligand-identity-held-out, not scaffold-held-out. The strict helper now parses
+each molecule and extracts its scaffold using the RDKit molecule argument;
+invalid SMILES raise instead of silently changing split semantics.
+
+The corrected descriptor diagnostic reports 121 ligands and 84 scaffolds in
+the uploaded test set. The earlier diagnostic reported all scaffolds
+unresolved. Train/validation/test exact-ligand overlaps of zero were reported,
+but scaffold overlap across the original cached frame has not yet been
+measured. No previous v3 metric below should be described as a
+scaffold-held-out result.
+
+The split cache request now includes the strict split version and RDKit
+version. Existing legacy Phase 1 caches are rejected, not rewritten in place.
+The already-keyed `graphs_hybrid_topo_v3` graph bundle has not changed format
+or graph version and may be reused only when it covers all requested ordered
+pairs with matching featurization/MCS settings.
+
+### 8.2 Uploaded test-prediction and LOMAP audit facts
+
+The uploaded prediction file has 7,522 rows. Real LOMAP is finite for 4,805
+and nonfinite for 2,717; every row excluded from the comparison was excluded
+only for nonfinite LOMAP, while the other compared fields were finite. Among
+the 4,805 finite difficulty scores, 4,696 (97.7%) are exactly 1.0, 67 are
+exactly 0.0 and all 67 are identical-SMILES pairs, and the remaining 42 are
+finite, non-self, non-maximal scores.
+
+Those 67 identical-SMILES rows have target values from 0.0071869535 to
+0.6050135476, with mean 0.1797280954. Their target provenance cannot be
+inferred from the prediction file. The raw CSV header inspected for this
+correction contains only the two compound-SMILES columns and
+`Difference in first_pass_free_energy_stderr`; it has no pair IDs, target,
+protocol, or effort metadata. No generating script was located in the
+repository. Source simulation records are needed to explain the nonzero
+targets; this is not a code issue the audit can resolve.
+
+### 8.3 Frozen historical metrics
+
+These are the supplied full-test metrics from the prior descriptor comparison.
+They are historical and are not validated scaffold-held-out estimates:
+
+| Method | Pearson r | Spearman ρ | AUROC | AUPRC | MSE |
+|---|---:|---:|---:|---:|---:|
+| Descriptors | 0.1257751774 | 0.0964957604 | 0.5716499850 | 0.3129275044 | 0.0266729213 |
+| Hybrid-topology GNN | 0.0525096376 | 0.0618886676 | 0.5383432002 | 0.2859979262 | 0.0297765029 |
+| Train-mean baseline | — | — | — | — | 0.0270027535 |
+
+The recorded best descriptor search candidate used 31 leaves and 200
+iterations, with validation Spearman ρ=0.1778400812 and validation MSE
+0.0350107667. Do not infer statistical superiority from these results.
+
+### 8.4 Immediate next steps
+
+The strict-scaffold Phase 1 v4 run is complete: train 2,272,233, validation
+16,377, test 7,646; 669,351 straddling pairs were dropped. Do not repeat that
+run. The next step is only the no3d LOMAP audit in §9 and `living_network/README.md`.
+It uses the same bounded diagnostic sample and resumes completed case IDs
+under the same request. Review the split counts and share the new
+`audit_manifest.json` and `cases.jsonl` before deciding on training. The
+requested split fractions do not guarantee counts after straddling-pair
+removal, so small or empty splits must be reviewed before any later training.
+
+---
+
+## 9. LOMAP mapper-configuration audit and no3d follow-up
+
+The first 34-case audit used the production-style mapper configuration
+(`threed=False`, with the installed `max3d=1` default). In the frozen sample,
+all 8 identical-SMILES cases scored similarity 1.0. All 8 saturated cases
+scored similarity 0.0, with `mncar_score` equal to 0. The 8 other finite cases
+reproduced their historical scores within approximately `1e-16`. Of the 8
+historically missing cases, 7 returned `no_mapping`; one now scored 0.0, and
+the reason for that change is unknown. The identical-toluene control scored
+1.0, while toluene-to-ethylbenzene returned `no_mapping`.
+
+`tmcsr_score` raised `NotImplementedError`, but it is not part of the
+default nine-rule product and does not explain the baseline failures. The
+installed default-score source explicitly identifies those nine rules,
+including `mncar_score`. MMFF status 1 denotes optimization nonconvergence,
+not an exception; the sampled audit cases had no preparation failures.
+
+The installed mapper source has defaults `max3d=1`, `threed=True`, and
+`shift=False`, while production constructs it with `threed=False` and relies
+on the other defaults. In published LOMAP 3.3.0, `mcs.py` lines 759–764 call
+`trim_mcs_mol(max_deviation=max3d, use_shift=shift)` whenever `max3d > 0`,
+independently of `threed`; that trimming uses RMSD-based selection. This
+configuration mismatch is confirmed for the published version and strongly
+supports geometric trimming as an explanation for the failed
+toluene-to-ethylbenzene control. A matched rerun against the installed
+cluster version is still needed to establish its extent:
+[LOMAP 3.3.0 `mcs.py`](https://raw.githubusercontent.com/OpenFreeEnergy/Lomap/v3.3.0/src/lomap/mcs.py).
+
+The matched `--max3d 0` follow-up is complete; its frozen outcomes and
+interpretation are recorded in §10. Do not attribute all 2,717 nonfinite
+historical LOMAP rows to trimming or timeouts. These diagnostics also do not
+establish that LOMAP is inherently weak on the dataset, and they do not
+resolve the missing simulation-target provenance described in §8.2.
+
+---
+
+## 10. Matched no3d LOMAP audit and saved-prediction rescore
+
+The second audit inspected all 34 cases and both manifests. It used exactly
+the same case IDs, source-predictions hash, seed 42, `per_group=8`, timeout 5,
+RDKit 2025.09.2, LOMAP 3.3.0, and GUFE 1.12.0 as the first audit; only
+`max3d` changed to 0. All 34 cases scored, with no failures:
+
+- The 8 identical-SMILES cases remained at similarity 1.0.
+- The 8 previously saturated cases all became positive, ranging from
+  0.004516580942612665 to 0.6376281516217733.
+- The 8 other-finite cases remained finite. Their scores generally changed;
+  one decreased and one was unchanged. Removing trimming does not guarantee
+  an increase in the final product of rule scores.
+- All 8 previously missing cases became finite: 7 positive and 1 zero. The
+  zero still comes from `mncar_score`; the cause of its previous
+  `no_mapping` outcome is unknown.
+- The identical-toluene control remained at 1.0. Toluene-to-ethylbenzene now
+  scored 0.9048374180359595 rather than `no_mapping`.
+
+The installed MCS source captured in the manifest confirms that geometric
+trimming runs whenever `max3d > 0`, independently of `threed`. The production
+baseline previously passed `threed=False` but relied on the default
+`max3d=1`; the corrected production mapper explicitly uses
+`threed=False, max3d=0.0, shift=False`. Together with the matched 34-case
+results, this establishes geometric pruning as the cause of the major
+failures observed in these audited cases. It does not establish that trimming
+or timeout caused all 2,717 nonfinite scores across the full historical
+test file, nor is this sample a statistical estimate of full-cohort effects.
+
+The saved-test rescore described above is complete; it did not train a model
+or change the split. The next authorized analysis is the validation-only
+descriptor learning curve documented in `living_network/README.md`, using
+nested training subsets of 100,000 and 500,000 rows. It uses training and
+validation data only for features, fits, and metrics; it produces no test
+predictions or metrics. The latest paired-bootstrap intervals all include
+zero, so no superiority claim is warranted. The rescored v3 results remain
+on the historical ligand-held-out cohort. The subsequent v4 descriptor run
+has verified scaffold separation, but its advantage over LOMAP remains
+uncertain under the paired group-bootstrap analysis.

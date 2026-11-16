@@ -601,6 +601,8 @@ def phase1_load(args, output_dir: str) -> pd.DataFrame:
         args.input, sample_size=int(args.sample_size), seed=args.seed,
         split_method=split_method, val_frac=args.val_frac,
         test_frac=args.test_frac,
+        split_version=artifacts.SPLIT_VERSION,
+        rdkit_version=Chem.rdBase.rdkitVersion,
     )
 
     if os.path.exists(pkl):
@@ -639,10 +641,7 @@ def phase1_load(args, output_dir: str) -> pd.DataFrame:
         )
         scaffold_of = {}
         for smi in all_smiles:
-            try:
-                scaffold_of[smi] = MurckoScaffold.MurckoScaffoldSmiles(smi=smi)
-            except Exception:
-                scaffold_of[smi] = smi  # fall back to full SMILES if scaffold fails
+            scaffold_of[smi] = artifacts.scaffold_smiles(smi)
 
         df["scaffold_a"] = df[SMILES_A_COLUMN].map(scaffold_of)
         df["scaffold_b"] = df[SMILES_B_COLUMN].map(scaffold_of)
@@ -979,7 +978,11 @@ def _lomap_like_score(smi_a: str, smi_b: str, mcs_timeout: int = 5) -> float:
     try:
         comp_a = gufe.SmallMoleculeComponent(rdkit=ma)
         comp_b = gufe.SmallMoleculeComponent(rdkit=mb)
-        mapper = lomap.LomapAtomMapper(time=mcs_timeout, threed=False)
+        # threed=False alone does NOT disable geometric trimming in LOMAP
+        # 3.3.0. Independently embedded conformers are not aligned poses.
+        mapper = lomap.LomapAtomMapper(
+            time=mcs_timeout, threed=False, max3d=0.0, shift=False,
+        )
         mapping = next(iter(mapper.suggest_mappings(comp_a, comp_b)), None)
         if mapping is None:
             return np.nan
