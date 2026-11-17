@@ -1,0 +1,7 @@
+name: openfe_growth
+channels:
+  - conda-forge
+dependencies:
+  - python=3.12
+  - openfe=1.13.0
+  - cuda-version=12.0

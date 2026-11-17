@@ -19,6 +19,13 @@ report distinguishes observed reference connections from alternative edges
 that need new simulations. Submit `prepare_fah_growth.sbatch` on one CPU.
 This is experiment preparation, not a completed growth-policy evaluation.
 
+For the six-ligand validation panel, see
+[the OpenFE/OpenMM setup](../docs/fah_growth_openfe_setup.md).
+`fetch_fah_growth_structures.py` builds a validated ligand/receptor bundle
+from the campaign's public setup files; `prepare_openfe_growth.py` writes
+OpenFE transformations and `run_openfe_growth_smoke.sbatch` runs a short
+stability test. The OpenFE steps are untested until run on the cluster.
+
 ## Earlier workflow: source-preserving Fah-XChem extraction
 
 Run these commands on the cluster from `living_network`. First install the
