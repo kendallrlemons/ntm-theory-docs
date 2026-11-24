@@ -104,16 +104,34 @@ split mismatch that leaked chemistry.
 
 ## 5. Prediction results
 
+The frozen [headline interval JSON](fah_headline_intervals.json) reports
+point estimate, 95% percentile interval, and valid bootstrap replicate
+count. Valid replicates were 1,000 for known-reference edge, pilot-complex,
+and pilot-solvent tasks; and 623 for strict-network edge, 621 for
+strict-network pilot-complex, and 641 for strict-network pilot-solvent.
+
+For known-reference uncertainty, variable scaffold groups are resampled
+while established reference groups are held fixed. Strict-network
+resampling uses the dyadic product of endpoint multiplicities, counting a
+self-pair once. Degenerate single-family draws and draws with fewer than
+three nonzero edge weights or undefined metrics are omitted; replicate
+counts are task-specific. These intervals condition on fixed checkpoints:
+they do not represent training-seed or between-campaign uncertainty.
+Comparisons are unadjusted.
+
+In the frozen JSON, `other` means hybrid-topology GNN for edge tasks and
+hypersphere + pilot for pilot tasks.
+
 ### 5.1 Known-reference edge uncertainty (structure only)
 
 Common cohort of 7,895 test edges.
 
 | Method | Pearson | Spearman | MSE |
 |---|---:|---:|---:|
-| LOMAP | 0.186 | 0.063 | not calibrated |
-| Boosted trees | 0.665 | 0.677 | 0.0238 |
-| Hybrid-topology GNN | 0.690 | 0.690 | 0.0223 |
-| Hypersphere GNN | 0.710 | 0.716 | 0.0206 |
+| LOMAP | 0.186 [0.051, 0.300] | 0.063 [−0.040, 0.168] | not calibrated |
+| Boosted trees | 0.665 [0.576, 0.712] | 0.677 [0.616, 0.724] | 0.0238 [0.0173, 0.0304] |
+| Hybrid-topology GNN | 0.689 [0.600, 0.735] | 0.690 [0.620, 0.744] | 0.0223 [0.0175, 0.0267] |
+| Hypersphere GNN | 0.710 [0.637, 0.747] | 0.716 [0.657, 0.764] | 0.0206 [0.0158, 0.0253] |
 
 - Hypersphere minus LOMAP: Pearson [0.43, 0.62], Spearman [0.57, 0.74].
 - Hypersphere minus trees: Pearson [0.018, 0.079], Spearman [0.016, 0.060].
@@ -131,10 +149,10 @@ LOMAP is better in 3 of 23 small source-specific comparisons.
 
 | Method | Pearson | Spearman |
 |---|---:|---:|
-| LOMAP | 0.271 | 0.327 |
-| Boosted trees | −0.002 | −0.049 |
-| Hybrid-topology GNN | 0.008 | −0.047 |
-| Hypersphere GNN | −0.007 | −0.079 |
+| LOMAP | 0.271 [0.244, 0.303] | 0.327 [0.250, 0.418] |
+| Boosted trees | −0.002 [−0.066, 0.055] | −0.049 [−0.113, 0.017] |
+| Hybrid-topology GNN | 0.008 [−0.045, 0.059] | −0.047 [−0.102, 0.009] |
+| Hypersphere GNN | −0.007 [−0.102, 0.113] | −0.079 [−0.168, 0.038] |
 
 No learned model transfers. This is one held-out campaign; it shows a
 failure case, not a rate of failure across campaigns. The experiment does
@@ -145,25 +163,39 @@ differences caused it.
 
 Generation-0 results are used to predict the generation-1 phase proxy.
 
-Known-reference setting (4,265 complex / 4,273 solvent common edges):
+Known-reference complex task (4,265 common edges):
 
-| Phase | Structure only (hypersphere) | Direct pilot | Hypersphere + pilot |
-|---|---|---|---|
-| Complex, Pearson / Spearman | 0.626 / 0.614 | 0.794 / 0.750 | 0.838 / 0.800 |
-| Solvent, Pearson / Spearman | 0.611 / 0.710 | 0.872 / 0.871 | 0.899 / 0.910 |
+| Method | Pearson | Spearman |
+|---|---:|---:|
+| Structure only (hypersphere) | 0.626 [0.587, 0.660] | 0.614 [0.569, 0.654] |
+| Direct pilot | 0.794 [0.772, 0.810] | 0.750 [0.714, 0.777] |
+| Hypersphere + pilot | 0.838 [0.821, 0.852] | 0.800 [0.765, 0.827] |
 
-Strict held-out campaign (4,684 complex / 4,659 solvent edges):
+Known-reference solvent task (4,273 common edges):
 
-| Phase | Method | Pearson | Spearman | MSE |
-|---|---|---:|---:|---:|
-| Complex | Structure-only hypersphere | 0.038 | 0.034 | 2.62 |
-| Complex | Direct pilot | 0.521 | 0.532 | 2.79 |
-| Complex | Learned pilot-only | 0.519 | 0.530 | 1.39 |
-| Complex | Hypersphere + pilot | 0.503 | 0.537 | 1.31 |
-| Solvent | Structure-only hypersphere | 0.157 | 0.146 | 1.70 |
-| Solvent | Direct pilot | 0.795 | 0.849 | 0.89 |
-| Solvent | Learned pilot-only | 0.802 | 0.849 | 0.46 |
-| Solvent | Hypersphere + pilot | 0.811 | 0.851 | 0.39 |
+| Method | Pearson | Spearman |
+|---|---:|---:|
+| Structure only (hypersphere) | 0.611 [0.550, 0.664] | 0.710 [0.647, 0.758] |
+| Direct pilot | 0.872 [0.831, 0.906] | 0.871 [0.847, 0.889] |
+| Hypersphere + pilot | 0.899 [0.876, 0.920] | 0.910 [0.892, 0.924] |
+
+Strict held-out complex task (4,684 edges):
+
+| Method | Pearson | Spearman | MSE |
+|---|---:|---:|---:|
+| Structure-only hypersphere | 0.038 [−0.045, 0.131] | 0.034 [−0.047, 0.117] | 2.62 [2.22, 3.02] |
+| Direct pilot | 0.521 [0.488, 0.551] | 0.532 [0.501, 0.562] | 2.79 [2.63, 2.94] |
+| Learned pilot-only | 0.519 [0.487, 0.548] | 0.530 [0.500, 0.561] | 1.39 [1.33, 1.46] |
+| Hypersphere + pilot | 0.503 [0.468, 0.532] | 0.537 [0.505, 0.570] | 1.31 [1.24, 1.39] |
+
+Strict held-out solvent task (4,659 edges):
+
+| Method | Pearson | Spearman | MSE |
+|---|---:|---:|---:|
+| Structure-only hypersphere | 0.157 [0.094, 0.228] | 0.146 [0.076, 0.225] | 1.70 [1.44, 2.02] |
+| Direct pilot | 0.795 [0.772, 0.821] | 0.849 [0.826, 0.868] | 0.89 [0.75, 1.09] |
+| Learned pilot-only | 0.802 [0.780, 0.825] | 0.849 [0.825, 0.868] | 0.46 [0.41, 0.53] |
+| Hypersphere + pilot | 0.811 [0.791, 0.833] | 0.851 [0.829, 0.869] | 0.39 [0.34, 0.44] |
 
 - Pilot information restores useful prediction in the held-out campaign.
 - The direct pilot estimate supplies almost all the ranking signal.
@@ -171,6 +203,33 @@ Strict held-out campaign (4,684 complex / 4,659 solvent edges):
   (calibration), with little change in rank correlation.
 - Adding structure through the GNN does not establish a Spearman gain over
   the learned pilot-only model in either phase.
+
+### 5.4 Route 1: frozen prediction-based selection
+
+Across 23 sources, Route 1 selects 1,980 of 7,895 known-reference edges:
+within each source, select `ceil(N/4)` records. One policy ranks by the
+lowest frozen predicted edge stderr; the comparator ranks by the lowest
+`1 − similarity` (LOMAP). Both use SHA256(`edge_id`) as the deterministic
+tie-breaker. Selected records are pooled across sources, and selection is
+repeated within each paired scaffold-bootstrap draw.
+
+The pooled mean reported edge stderr is 0.369 [0.348, 0.400] for the frozen
+prediction selection and 0.418 [0.382, 0.462] for the LOMAP selection. The
+paired difference (prediction minus LOMAP) is −0.050 [−0.078, −0.023].
+Values are in the source's native edge-stderr units. This retrospective
+comparison does not establish causal savings or an optimal anchor choice.
+
+![Route 1 selected means and paired difference](fah_route1.svg)
+
+PNG slide version: [fah_route1.png](fah_route1.png).
+
+The frozen values are in [fah_headline_intervals.json](fah_headline_intervals.json).
+Regenerate that JSON from saved evaluation folders with
+[`living_network/fah_headline_intervals.py`](../living_network/fah_headline_intervals.py):
+
+```sh
+python living_network/fah_headline_intervals.py ~/Downloads > docs/fah_headline_intervals.json
+```
 
 ## 6. Allocation sensitivity study
 
